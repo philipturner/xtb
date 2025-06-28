@@ -305,11 +305,6 @@ subroutine singlepoint(self, env, mol, chk, printlevel, restart, &
          call print_gbsa_info(env%unit, mol%sym, solvation)
       endif
       write(env%unit,'(a)')
-      if (.not.set%silent) then
-         call open_file(ich,'gfnff_charges','w')
-         call print_charges(ich,mol%n,chk%nlist%q)
-         call close_file(ich)
-      end if
     
     else if (set%mode_extrun .eq. p_ext_oniom) then
       write(env%unit,outfmt) "total energy      ", results%e_total,"Eh   "
@@ -370,18 +365,5 @@ subroutine writeInfo(self, unit, mol)
    end if
 
 end subroutine writeInfo
-
-subroutine print_charges(ifile,n,q)
-   implicit none
-   integer, intent(in)  :: ifile
-   integer, intent(in)  :: n
-   real(wp),intent(in)  :: q(n)
-   integer :: i
-   if (ifile.ne.-1) then
-      do i = 1, n
-         write(ifile,'(f14.8)') q(i)
-      end do
-   end if
-end subroutine print_charges
 
 end module xtb_gfnff_calculator
