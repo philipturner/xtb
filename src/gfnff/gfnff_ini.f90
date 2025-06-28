@@ -118,7 +118,11 @@ subroutine gfnff_ini(env,pr,makeneighbor,mol,gen,param,topo,neigh,efield,accurac
       call gfnff_thresholds(accuracy, dispthr, cnthr, repthr, hbthr1, hbthr2)
 
       ! TODO: What is the point of this statement? I never see it printed.
-      ! What does 'pr' mean or do? Figuring that out.
+      ! The flag 'pr' is always 0 when called in code, even when verbosity is
+      ! set to all 3 possible values via the C API.
+      !
+      ! I can't understand the 'setparam' and its difference from 'env'. Just
+      ! comment out the troublesome code and avoid making a PR to the main repo.
       if (pr) then
          write(env%unit,*)
          write(env%unit,'(10x,"entering GFN-FF setup routine... ",i0)') mol%n
@@ -126,6 +130,7 @@ subroutine gfnff_ini(env,pr,makeneighbor,mol,gen,param,topo,neigh,efield,accurac
 
       write(env%unit,*)
       write(env%unit,'(10x,"pr :",i2)') i
+      write(env%unit,'(10x,"pr :",i2)') env%verbosity
       write(env%unit,'(10x,"==================== Thresholds ====================")')
       write(env%unit,'(10x,"CN  :",f12.5)')   cnthr
       write(env%unit,'(10x,"rep :",f12.5)')   repthr
