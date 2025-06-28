@@ -117,12 +117,15 @@ subroutine gfnff_ini(env,pr,makeneighbor,mol,gen,param,topo,neigh,efield,accurac
 
       call gfnff_thresholds(accuracy, dispthr, cnthr, repthr, hbthr1, hbthr2)
 
+      ! TODO: What is the point of this statement? I never see it printed.
+      ! What does 'pr' mean or do? Figuring that out.
       if (pr) then
          write(env%unit,*)
          write(env%unit,'(10x,"entering GFN-FF setup routine... ",i0)') mol%n
       endif
 
       write(env%unit,*)
+      write(env%unit,'(10x,"pr :",i2)') i
       write(env%unit,'(10x,"==================== Thresholds ====================")')
       write(env%unit,'(10x,"CN  :",f12.5)')   cnthr
       write(env%unit,'(10x,"rep :",f12.5)')   repthr
