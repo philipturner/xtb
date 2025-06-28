@@ -2480,9 +2480,9 @@ subroutine gfnff_topo_changes(env, neigh)
          neigh%nbm(1:40,idx,1) = int_tmp
          neigh%nbm(neigh%numnb,idx,1) = set%ffnb(42,i)
       end do
-      write(env%unit,*) ''
-      write(env%unit,*) 'The neighborlist has been adjusted according to the input file.'
-      write(env%unit,*) ''
+      !write(env%unit,*) ''
+      !write(env%unit,*) 'The neighborlist has been adjusted according to the input file.'
+      !write(env%unit,*) ''
    end if
 
 
