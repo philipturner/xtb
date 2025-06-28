@@ -62,17 +62,17 @@ subroutine gfnff_setup(env,verbose,restart,mol,gen,param,topo,neigh,accuracy,efi
 
   call gfnff_set_param(mol%n, gen, param)
   param%dispscale = set%dispscale
-  if (restart) then
-     call read_restart_gff(env,'gfnff_topo',mol%n,version,success,.true.,topo,neigh)
-     if (success) then
-        write(env%unit,'(10x,"GFN-FF topology read from file successfully!")')
-        return
-     else
-        call env%warning("Could not read topology file.", source)
-        call env%check(exitRun)
-        if (exitRun) return
-     end if
-  end if
+  !if (restart) then
+  !   call read_restart_gff(env,'gfnff_topo',mol%n,version,success,.true.,topo,neigh)
+  !   if (success) then
+  !      write(env%unit,'(10x,"GFN-FF topology read from file successfully!")')
+  !      return
+  !   else
+  !      call env%warning("Could not read topology file.", source)
+  !      call env%check(exitRun)
+  !      if (exitRun) return
+  !   end if
+  !end if
 
   call gfnff_ini(env,verbose,ini,mol,gen,param,topo,neigh,efield,accuracy)
 
@@ -82,9 +82,9 @@ subroutine gfnff_setup(env,verbose,restart,mol,gen,param,topo,neigh,accuracy,efi
      return
   end if
 
-  if (.not.mol%info%two_dimensional) then
-     call write_restart_gff(env,'gfnff_topo',mol%n,version,topo,neigh)
-  end if
+  !if (.not.mol%info%two_dimensional) then
+  !   call write_restart_gff(env,'gfnff_topo',mol%n,version,topo,neigh)
+  !end if
 
 end subroutine gfnff_setup
 
