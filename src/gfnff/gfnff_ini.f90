@@ -531,7 +531,7 @@ subroutine gfnff_ini(env,pr,makeneighbor,mol,gen,param,topo,neigh,efield,accurac
       call mrecgffPBC(mol%n,neigh%numctr,neigh%numnb,neigh%nbf,topo%nfrag,topo%fraglist) 
       if (setup_print) write(env%unit,'(10x,"#fragments for EEQ constrain: ",i0)') topo%nfrag
 !     read QM info if it exists
-      call open_file(ich, 'charges', 'r')
+      ich = -1 ! swift-xtb: never read a 'charges' file from the working directory
       if (ich /= -1) then
          qtmp = 0
          err = 0

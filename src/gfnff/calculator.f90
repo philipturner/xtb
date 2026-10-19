@@ -311,7 +311,7 @@ subroutine singlepoint(self, env, mol, chk, printlevel, restart, &
          call print_gbsa_info(env%unit, mol%sym, solvation)
       endif
       write(env%unit,'(a)')
-      if (.not.set%silent) then
+      if (.false.) then ! swift-xtb: never write a 'gfnff_charges' file
          call open_file(ich,'gfnff_charges','w')
          call print_charges(ich,mol%n,chk%nlist%q)
          call close_file(ich)
