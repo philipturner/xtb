@@ -265,7 +265,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
       &        H0,H,S,dpint,qpint,X,P,ies, &
       &        maxiter,startpdiag,scfconv,qconv, &
       &        minpr,pr, &
-      &        fail,jter)
+      &        fail,jter,fp64_only,used_fp32)
    use xtb_mctc_convert, only : autoev,evtoau
    use xtb_scc_timer
 
@@ -298,6 +298,10 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    logical, intent(in)  :: minpr
    logical, intent(in)  :: pr
    logical, intent(out) :: fail
+   !> ignore XTB_SCC_FP32_RMSQ: every eigensolve in FP64 (the restart after an FP32 run failed)
+   logical, intent(in), optional :: fp64_only
+   !> whether any eigensolve of this call ran in FP32
+   logical, intent(out), optional :: used_fp32
 !! ------------------------------------------------------------------------
    integer, intent(in)  :: at(n)
 !! ------------------------------------------------------------------------
@@ -414,6 +418,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    character(len=64) :: sp_env
    integer  :: sp_len, sp_stat
 
+   if (present(used_fp32)) used_fp32 = .false.
    call scc_timer_start
    call env%check(fail)
    if (fail) return
@@ -421,13 +426,17 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    m_occ = 0
    call scc_timer_setup(ndim)
 
-   ! opt-in (XTB_SCC_FP32_RMSQ=1e-3 for example): it fails the 100 K cycle-count and
-   ! convergence gates on a few slow radicals, though it passes every gate at 300 and 1000 K
+   ! opt-in (XTB_SCC_FP32_RMSQ=1e-3 for example): FP32 changes the trajectory and can make fragile
+   ! runs fail to converge; scf (scf_module) then reruns the SCC in FP64 from the same start
+   ! (fp64_only). Cold runs still differ from FP64 within the gates; meant for warm starts.
    sp_rmsq = 0.0_wp
    call get_environment_variable('XTB_SCC_FP32_RMSQ', sp_env, length=sp_len)
    if (sp_len > 0) then
       read(sp_env, *, iostat=sp_stat) sp_rmsq
       if (sp_stat /= 0) sp_rmsq = 0.0_wp
+   end if
+   if (present(fp64_only)) then
+      if (fp64_only) sp_rmsq = 0.0_wp
    end if
    rmsq = huge(1.0_wp)
 
@@ -494,6 +503,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    !call solve(fulldiag,ndim,ihomo,scfconv,H,S,X,P,emo,fail)
 
    use_sp = sp_rmsq > 0.0_wp .and. .not.lastdiag .and. rmsq > sp_rmsq
+   if (use_sp .and. present(used_fp32)) used_fp32 = .true.
    if (use_sp) then
       call solver%fact_solve_subspace_mixed(env, H, emo)
    else

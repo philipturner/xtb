@@ -227,6 +227,17 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
       '(10x,":",2x,a,a18,      10x,":")'
 
    logical :: exitRun
+   ! FP32 restart: the SCC's inputs, kept while XTB_SCC_FP32_RMSQ is set, to rerun it in FP64 if it fails
+   logical :: fp32_requested, used_fp32
+   integer :: jter_save
+   real(wp) :: broydamp_save, gsolv_save
+   real(wp), allocatable :: qq_save(:), qlmom_save(:, :), cm5_save(:)
+   type(TWavefunction), allocatable :: wfn_save
+   type(TxTBCoulomb), allocatable :: ies_save
+   type(TxTBDispersion), allocatable :: scD4_save
+   class(TSolvation), allocatable :: solvation_save
+   character(len=64) :: fp32_env
+   integer :: fp32_len, fp32_stat, fp32_maxiter
 
 !  broyden stuff
    logical  :: broy
@@ -618,6 +629,35 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
    !$acc enter data copyin(s, dpint, qpint)
 
    call init(solver, env, S)
+   ! Opt-in FP32 eigensolves (XTB_SCC_FP32_RMSQ, scc_core) change the SCC trajectory, and fragile runs can fail to
+   ! converge with them. Keep the SCC's inputs; if a run that used FP32 fails, rerun it from the same start in FP64,
+   ! which reproduces the FP64 result exactly. Meant for warm starts: a caller sets the variable around seeded calls.
+   ! The FP32 attempt stops after XTB_SCC_FP32_MAXITER cycles (default 160; converged production runs need <= 130).
+   call get_environment_variable('XTB_SCC_FP32_RMSQ', fp32_env, length=fp32_len)
+   fp32_requested = fp32_len > 0
+   used_fp32 = .false.
+   fp32_maxiter = maxiter
+   if (fp32_requested) then
+      fp32_maxiter = min(maxiter, 160)
+      call get_environment_variable('XTB_SCC_FP32_MAXITER', fp32_env, length=fp32_len)
+      if (fp32_len > 0) then
+         read(fp32_env, *, iostat=fp32_stat) fp32_maxiter
+         if (fp32_stat /= 0) fp32_maxiter = min(maxiter, 160)
+         fp32_maxiter = max(1, min(maxiter, fp32_maxiter))
+      end if
+   end if
+   if (fp32_requested) then
+      allocate(wfn_save, source=wfn)
+      allocate(ies_save, source=ies)
+      if (allocated(scD4)) allocate(scD4_save, source=scD4)
+      if (allocated(solvation)) allocate(solvation_save, source=solvation)
+      qq_save = qq
+      qlmom_save = qlmom
+      cm5_save = cm5
+      gsolv_save = gsolv
+      broydamp_save = set%broydamp
+      jter_save = jter
+   end if
    call scc(env,xtbData,solver,mol%n,wfn%nel,wfn%nopen,basis%nao,ndp,nqp,nmat,basis%nshell, &
       &     mol%at,matlist,mdlst,mqlst,basis%aoat2,basis%ao2sh,basis%ash, &
       &     wfn%q,wfn%dipm,wfn%qp,qq,qlmom,wfn%qsh,zsh, &
@@ -630,9 +670,43 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
       &     eel,ees,eaes,epol,ed,epcem,egap, &
       &     wfn%emo,wfn%ihomo,wfn%ihomoa,wfn%ihomob, &
       &     H0,wfn%C,S,dpint,qpint,X,wfn%P,ies, &
-      &     maxiter,startpdiag,scfconv,qconv, &
+      &     fp32_maxiter,startpdiag,scfconv,qconv, &
       &     minpr,pr, &
-      &     fail,jter)
+      &     fail,jter,used_fp32=used_fp32)
+
+   call env%check(exitRun)
+   if (fp32_requested .and. fail .and. (used_fp32 .or. fp32_maxiter < maxiter) .and. .not.exitRun) then
+      if (pr) write(env%unit,'(/,3x,a)') &
+         "*** SCC with FP32 eigensolves did not converge: restarting in FP64 ***"
+      wfn = wfn_save
+      ies = ies_save
+      if (allocated(scD4_save)) scD4 = scD4_save
+      if (allocated(solvation_save)) then
+         deallocate(solvation)
+         allocate(solvation, source=solvation_save)
+      end if
+      qq = qq_save
+      qlmom = qlmom_save
+      cm5 = cm5_save
+      gsolv = gsolv_save
+      set%broydamp = broydamp_save
+      jter = jter_save
+      call scc(env,xtbData,solver,mol%n,wfn%nel,wfn%nopen,basis%nao,ndp,nqp,nmat,basis%nshell, &
+         &     mol%at,matlist,mdlst,mqlst,basis%aoat2,basis%ao2sh,basis%ash, &
+         &     wfn%q,wfn%dipm,wfn%qp,qq,qlmom,wfn%qsh,zsh, &
+         &     mol%xyz,aes, &
+         &     cm5,cm5a,gsolv,solvation, &
+         &     scD4, &
+         &     broy,set%broydamp,damp0, &
+         &     lpcem,ves,vpc, &
+         &     et,wfn%focc,wfn%focca,wfn%foccb,wfn%efa,wfn%efb, &
+         &     eel,ees,eaes,epol,ed,epcem,egap, &
+         &     wfn%emo,wfn%ihomo,wfn%ihomoa,wfn%ihomob, &
+         &     H0,wfn%C,S,dpint,qpint,X,wfn%P,ies, &
+         &     maxiter,startpdiag,scfconv,qconv, &
+         &     minpr,pr, &
+         &     fail,jter,fp64_only=.true.)
+   end if
 
    !$acc exit data delete(s, dpint, qpint)
 
