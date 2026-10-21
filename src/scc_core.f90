@@ -408,6 +408,11 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    logical  :: converged
    logical  :: econverged
    logical  :: qconverged
+   ! mixed precision: FP32 eigensolves while the charges still change by more than sp_rmsq
+   real(wp) :: sp_rmsq
+   logical  :: use_sp
+   character(len=64) :: sp_env
+   integer  :: sp_len, sp_stat
 
    call scc_timer_start
    call env%check(fail)
@@ -415,6 +420,16 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    allocate(C_occ(ndim, ndim), source = 0.0_wp)
    m_occ = 0
    call scc_timer_setup(ndim)
+
+   ! opt-in (XTB_SCC_FP32_RMSQ=1e-3 for example): it fails the 100 K cycle-count and
+   ! convergence gates on a few slow radicals, though it passes every gate at 300 and 1000 K
+   sp_rmsq = 0.0_wp
+   call get_environment_variable('XTB_SCC_FP32_RMSQ', sp_env, length=sp_len)
+   if (sp_len > 0) then
+      read(sp_env, *, iostat=sp_stat) sp_rmsq
+      if (sp_stat /= 0) sp_rmsq = 0.0_wp
+   end if
+   rmsq = huge(1.0_wp)
 
    converged = .false.
    lastdiag = .false.
@@ -478,7 +493,14 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
 
    !call solve(fulldiag,ndim,ihomo,scfconv,H,S,X,P,emo,fail)
 
-   call solver%fact_solve_subspace(env, H, emo)
+   use_sp = sp_rmsq > 0.0_wp .and. .not.lastdiag .and. rmsq > sp_rmsq
+   if (use_sp) then
+      call solver%fact_solve_subspace_mixed(env, H, emo)
+   else
+      call solver%fact_solve_subspace(env, H, emo)
+   end if
+   ! the iteration printout's last column now shows FP64 (T) or FP32 (F) eigensolves
+   fulldiag = .not.use_sp
    call env%check(fail)
    if (fail) then
       call env%error("Diagonalization of Hamiltonian failed", source)

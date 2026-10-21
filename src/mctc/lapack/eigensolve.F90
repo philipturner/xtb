@@ -80,6 +80,49 @@ module xtb_mctc_lapack_eigensolve
          integer, intent(in) :: liwork
          integer, intent(out) :: info
       end subroutine dstedc
+      pure subroutine ssytrd(uplo, n, a, lda, d, e, tau, work, lwork, info)
+         import :: sp
+         character(len=1), intent(in) :: uplo
+         integer, intent(in) :: n
+         integer, intent(in) :: lda
+         real(sp), intent(inout) :: a(lda, *)
+         real(sp), intent(out) :: d(*)
+         real(sp), intent(out) :: e(*)
+         real(sp), intent(out) :: tau(*)
+         real(sp), intent(inout) :: work(*)
+         integer, intent(in) :: lwork
+         integer, intent(out) :: info
+      end subroutine ssytrd
+      pure subroutine sstedc(compz, n, d, e, z, ldz, work, lwork, iwork, liwork, info)
+         import :: sp
+         character(len=1), intent(in) :: compz
+         integer, intent(in) :: n
+         integer, intent(in) :: ldz
+         real(sp), intent(inout) :: d(*)
+         real(sp), intent(inout) :: e(*)
+         real(sp), intent(inout) :: z(ldz, *)
+         real(sp), intent(inout) :: work(*)
+         integer, intent(in) :: lwork
+         integer, intent(inout) :: iwork(*)
+         integer, intent(in) :: liwork
+         integer, intent(out) :: info
+      end subroutine sstedc
+      pure subroutine sormtr(side, uplo, trans, m, n, a, lda, tau, c, ldc, work, lwork, info)
+         import :: sp
+         character(len=1), intent(in) :: side
+         character(len=1), intent(in) :: uplo
+         character(len=1), intent(in) :: trans
+         integer, intent(in) :: m
+         integer, intent(in) :: n
+         integer, intent(in) :: lda
+         integer, intent(in) :: ldc
+         real(sp), intent(in) :: a(lda, *)
+         real(sp), intent(in) :: tau(*)
+         real(sp), intent(inout) :: c(ldc, *)
+         real(sp), intent(inout) :: work(*)
+         integer, intent(in) :: lwork
+         integer, intent(out) :: info
+      end subroutine sormtr
       pure subroutine dormtr(side, uplo, trans, m, n, a, lda, tau, c, ldc, work, lwork, info)
          import :: dp
          character(len=1), intent(in) :: side
@@ -111,6 +154,16 @@ module xtb_mctc_lapack_eigensolve
       real(dp), allocatable :: tau(:)
       real(dp), allocatable :: esub(:)
       real(dp), allocatable :: dwork_trd(:)
+      !> FP32 copies for mixed-precision SCC cycles (allocated on first use)
+      real(sp), allocatable :: amat_s(:, :)
+      real(sp), allocatable :: zmat_s(:, :)
+      real(sp), allocatable :: tau_s(:)
+      real(sp), allocatable :: esub_s(:)
+      real(sp), allocatable :: eval_s(:)
+      real(sp), allocatable :: swork_dc(:)
+      real(sp), allocatable :: swork_trd(:)
+      !> Whether the last subspace solve ran in FP32 (selects the back-transformation)
+      logical :: last_sp = .false.
 #ifdef USE_CUSOLVER
       integer :: lwork
 #endif
@@ -123,6 +176,7 @@ module xtb_mctc_lapack_eigensolve
       procedure :: dfact_solve => mctc_dsygvd_factorized
       procedure :: fact_solve_subspace => mctc_dsygvd_fact_subspace
       procedure :: fact_backtransform => mctc_dsygvd_fact_backtransform
+      procedure :: fact_solve_subspace_mixed => mctc_dsygvd_fact_subspace_mixed
    end type TEigenSolver
 
 
@@ -344,26 +398,14 @@ subroutine mctc_dsygvd_fact_subspace(self, env, amat, eval, cmat, m_sub)
    real(dp), intent(out) :: eval(:)
    real(dp), intent(inout), optional :: cmat(:, :)
    integer, intent(in), optional :: m_sub
-   integer :: j, jj, k, info, ldwork, liwork, ldwork_trd
+   integer :: info, ldwork, liwork, ldwork_trd
 
    ldwork_trd = size(self%dwork_trd)
    ldwork = size(self%dwork)
    liwork = size(self%iwork)
 
-   do j = 1, self%n, nb
-      jj = min(self%n, j + nb - 1)
-      k = jj - j + 1
-      self%zmat(1:jj, j:jj) = amat(1:jj, j:jj)
-      call blas_trmm('R', 'U', 'N', 'N', jj, k, 1.0_dp, self%dbmat(j:jj, j:jj), k, &
-         & self%zmat(:, j:jj), self%n)
-      call blas_gemm('N', 'N', jj, k, j - 1, 1.0_dp, amat, self%n, &
-         & self%dbmat(:, j:jj), self%n, 1.0_dp, self%zmat(:, j:jj), self%n)
-      call blas_trmm('L', 'U', 'T', 'N', jj, k, 1.0_dp, self%dbmat, self%n, &
-         & self%zmat(:, j:jj), self%n)
-   end do
-   do j = 1, self%n
-      amat(1:j, j) = self%zmat(1:j, j)
-   end do
+   call congruence(self, amat)
+   self%last_sp = .false.
 
    call dsytrd('U', self%n, amat, self%n, eval, self%esub, self%tau, &
       & self%dwork_trd, ldwork_trd, info)
@@ -398,6 +440,21 @@ subroutine mctc_dsygvd_fact_backtransform(self, env, amat, cmat, ilo, ihi)
    if (m <= 0) return
    ldwork_trd = size(self%dwork_trd)
 
+   if (self%last_sp) then
+      ! eigenvectors of the FP32 tridiagonal reduction, transformed in FP32
+      call sormtr('L', 'U', 'N', self%n, m, self%amat_s, self%n, self%tau_s, &
+         & self%zmat_s(:, ilo:ihi), self%n, self%swork_trd, size(self%swork_trd), info)
+      if (info /= 0) then
+         call env%error("Failed to back-transform eigenvectors", source)
+         return
+      end if
+      self%zmat(:, ilo:ihi) = real(self%zmat_s(:, ilo:ihi), dp)
+      call blas_trmm('L', 'U', 'N', 'N', self%n, m, 1.0_dp, self%dbmat, self%n, &
+         & self%zmat(:, ilo:ihi), self%n)
+      cmat(:, ilo:ihi) = self%zmat(:, ilo:ihi)
+      return
+   end if
+
    call dormtr('L', 'U', 'N', self%n, m, amat, self%n, self%tau, &
       & self%zmat(:, ilo:ihi), self%n, self%dwork_trd, ldwork_trd, info)
    if (info /= 0) then
@@ -409,5 +466,73 @@ subroutine mctc_dsygvd_fact_backtransform(self, env, amat, cmat, ilo, ihi)
    cmat(:, ilo:ihi) = self%zmat(:, ilo:ihi)
 
 end subroutine mctc_dsygvd_fact_backtransform
+
+
+!> Upper triangle of the congruence X^T H X (X = U^-1 in dbmat), overwriting amat
+subroutine congruence(self, amat)
+   class(TEigenSolver), intent(inout) :: self
+   real(dp), intent(inout) :: amat(:, :)
+   integer :: j, jj, k
+
+   do j = 1, self%n, nb
+      jj = min(self%n, j + nb - 1)
+      k = jj - j + 1
+      self%zmat(1:jj, j:jj) = amat(1:jj, j:jj)
+      call blas_trmm('R', 'U', 'N', 'N', jj, k, 1.0_dp, self%dbmat(j:jj, j:jj), k, &
+         & self%zmat(:, j:jj), self%n)
+      call blas_gemm('N', 'N', jj, k, j - 1, 1.0_dp, amat, self%n, &
+         & self%dbmat(:, j:jj), self%n, 1.0_dp, self%zmat(:, j:jj), self%n)
+      call blas_trmm('L', 'U', 'T', 'N', jj, k, 1.0_dp, self%dbmat, self%n, &
+         & self%zmat(:, j:jj), self%n)
+   end do
+   do j = 1, self%n
+      amat(1:j, j) = self%zmat(1:j, j)
+   end do
+
+end subroutine congruence
+
+
+!> As mctc_dsygvd_fact_subspace, but the tridiagonal reduction, divide and conquer
+!> and the later back-transformation (fact_backtransform) run in FP32. Meant for the
+!> early SCC cycles only: eigenvalues and density carry FP32 errors (~1e-6 relative).
+subroutine mctc_dsygvd_fact_subspace_mixed(self, env, amat, eval)
+   character(len=*), parameter :: source = 'mctc_lapack_dsygvd_fact_subspace_mixed'
+   class(TEigenSolver), intent(inout) :: self
+   type(TEnvironment), intent(inout) :: env
+   real(dp), intent(inout) :: amat(:, :)
+   real(dp), intent(out) :: eval(:)
+   integer :: j, info
+   real(sp) :: work_trd_q(1), work_orm_q(1)
+
+   if (.not. allocated(self%amat_s)) then
+      allocate(self%amat_s(self%n, self%n), self%zmat_s(self%n, self%n), &
+         & self%tau_s(self%n), self%esub_s(self%n), self%eval_s(self%n), &
+         & self%swork_dc(1 + 4*self%n + self%n**2))
+      call ssytrd('U', self%n, self%amat_s, self%n, self%eval_s, self%esub_s, &
+         & self%tau_s, work_trd_q, -1, info)
+      call sormtr('L', 'U', 'N', self%n, self%n, self%amat_s, self%n, self%tau_s, &
+         & self%zmat_s, self%n, work_orm_q, -1, info)
+      allocate(self%swork_trd(max(1, self%n, int(work_trd_q(1)), int(work_orm_q(1)))))
+   end if
+
+   call congruence(self, amat)
+   do j = 1, self%n
+      self%amat_s(1:j, j) = real(amat(1:j, j), sp)
+   end do
+
+   call ssytrd('U', self%n, self%amat_s, self%n, self%eval_s, self%esub_s, self%tau_s, &
+      & self%swork_trd, size(self%swork_trd), info)
+   if (info == 0) then
+      call sstedc('I', self%n, self%eval_s, self%esub_s, self%zmat_s, self%n, &
+         & self%swork_dc, size(self%swork_dc), self%iwork, size(self%iwork), info)
+   end if
+   if (info /= 0) then
+      call env%error("Failed to compute eigenvalues and eigenvectors", source)
+      return
+   end if
+   eval = real(self%eval_s, dp)
+   self%last_sp = .true.
+
+end subroutine mctc_dsygvd_fact_subspace_mixed
 
 end module xtb_mctc_lapack_eigensolve
