@@ -22,6 +22,7 @@ list(APPEND srcs
    "${dir}/geneigval.f90"
    "${dir}/gst.f90"
    "${dir}/stdeigval.f90"
+   "${dir}/sytrd.c"
    "${dir}/trf.f90"
    "${dir}/tri.f90"
    "${dir}/trs.f90"

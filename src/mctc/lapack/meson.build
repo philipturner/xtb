@@ -20,6 +20,7 @@ srcs += files(
    'geneigval.f90',
    'gst.f90',
    'stdeigval.f90',
+   'sytrd.c',
    'trf.f90',
    'tri.f90',
    'trs.f90',

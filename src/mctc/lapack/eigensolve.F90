@@ -80,6 +80,17 @@ module xtb_mctc_lapack_eigensolve
          integer, intent(in) :: liwork
          integer, intent(out) :: info
       end subroutine dstedc
+      !> LAPACK's dsytrd ('U') with a vectorized symmetric matrix-vector product (sytrd.c)
+      subroutine xtb_dsytrd_upper(n, a, lda, d, e, tau, work) bind(c, name='xtb_dsytrd_upper')
+         import :: dp
+         integer, intent(in) :: n
+         integer, intent(in) :: lda
+         real(dp), intent(inout) :: a(lda, *)
+         real(dp), intent(out) :: d(*)
+         real(dp), intent(out) :: e(*)
+         real(dp), intent(out) :: tau(*)
+         real(dp), intent(inout) :: work(*)
+      end subroutine xtb_dsytrd_upper
       pure subroutine ssytrd(uplo, n, a, lda, d, e, tau, work, lwork, info)
          import :: sp
          character(len=1), intent(in) :: uplo
@@ -248,7 +259,7 @@ subroutine initDEigenSolver(self, env, bmat)
       & work_trd_q, -1, info)
    call dormtr('L', 'U', 'N', self%n, self%n, self%dbmat, lda, self%tau, &
       & self%zmat, lda, work_orm_q, -1, info)
-   lwork_trd = max(1, self%n, int(work_trd_q(1)), int(work_orm_q(1)))
+   lwork_trd = max(1, 32*self%n, int(work_trd_q(1)), int(work_orm_q(1)))
    allocate(self%dwork_trd(lwork_trd))
 
    ! Check for Cholesky factorisation
@@ -407,8 +418,8 @@ subroutine mctc_dsygvd_fact_subspace(self, env, amat, eval, cmat, m_sub)
    call congruence(self, amat)
    self%last_sp = .false.
 
-   call dsytrd('U', self%n, amat, self%n, eval, self%esub, self%tau, &
-      & self%dwork_trd, ldwork_trd, info)
+   call xtb_dsytrd_upper(self%n, amat, self%n, eval, self%esub, self%tau, self%dwork_trd)
+   info = 0
    if (info == 0) then
       call dstedc('I', self%n, eval, self%esub, self%zmat, self%n, &
          & self%dwork, ldwork, self%iwork, liwork, info)
