@@ -415,6 +415,9 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    ! mixed precision: FP32 eigensolves while the charges still change by more than sp_rmsq
    real(wp) :: sp_rmsq
    logical  :: use_sp
+   ! XTB_SCC_FP32_REFINE=1: each FP32 eigensolve is refined in FP64 for the orbitals up to the
+   ! last occupied one (previous cycle, or the HOMO) + 32 (eigensolve.F90, refine_block)
+   logical  :: sp_refine
    character(len=64) :: sp_env
    integer  :: sp_len, sp_stat
 
@@ -438,6 +441,9 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    if (present(fp64_only)) then
       if (fp64_only) sp_rmsq = 0.0_wp
    end if
+   call get_environment_variable('XTB_SCC_FP32_REFINE', sp_env, length=sp_len)
+   sp_refine = sp_len > 0
+   if (sp_refine) sp_refine = trim(sp_env) /= '0'
    rmsq = huge(1.0_wp)
 
    converged = .false.
@@ -504,7 +510,10 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
 
    use_sp = sp_rmsq > 0.0_wp .and. .not.lastdiag .and. rmsq > sp_rmsq
    if (use_sp .and. present(used_fp32)) used_fp32 = .true.
-   if (use_sp) then
+   if (use_sp .and. sp_refine) then
+      call solver%fact_solve_subspace_mixed(env, H, emo, &
+         & nref=min(ndim, max(m_occ, ihomoa, ihomob) + 32))
+   else if (use_sp) then
       call solver%fact_solve_subspace_mixed(env, H, emo)
    else
       call solver%fact_solve_subspace(env, H, emo)

@@ -66,6 +66,39 @@ module xtb_mctc_lapack_eigensolve
          integer, intent(in) :: lwork
          integer, intent(out) :: info
       end subroutine dsytrd
+      subroutine dsymm(side, uplo, m, n, alpha, a, lda, b, ldb, beta, c, ldc)
+         import :: dp
+         character(len=1), intent(in) :: side, uplo
+         integer, intent(in) :: m, n, lda, ldb, ldc
+         real(dp), intent(in) :: alpha, beta
+         real(dp), intent(in) :: a(lda, *), b(ldb, *)
+         real(dp), intent(inout) :: c(ldc, *)
+      end subroutine dsymm
+      subroutine dsyrk(uplo, trans, n, k, alpha, a, lda, beta, c, ldc)
+         import :: dp
+         character(len=1), intent(in) :: uplo, trans
+         integer, intent(in) :: n, k, lda, ldc
+         real(dp), intent(in) :: alpha, beta
+         real(dp), intent(in) :: a(lda, *)
+         real(dp), intent(inout) :: c(ldc, *)
+      end subroutine dsyrk
+      subroutine dpotrf(uplo, n, a, lda, info)
+         import :: dp
+         character(len=1), intent(in) :: uplo
+         integer, intent(in) :: n, lda
+         real(dp), intent(inout) :: a(lda, *)
+         integer, intent(out) :: info
+      end subroutine dpotrf
+      subroutine dsyevd(jobz, uplo, n, a, lda, w, work, lwork, iwork, liwork, info)
+         import :: dp
+         character(len=1), intent(in) :: jobz, uplo
+         integer, intent(in) :: n, lda, lwork, liwork
+         real(dp), intent(inout) :: a(lda, *)
+         real(dp), intent(out) :: w(*)
+         real(dp), intent(inout) :: work(*)
+         integer, intent(inout) :: iwork(*)
+         integer, intent(out) :: info
+      end subroutine dsyevd
       pure subroutine dstedc(compz, n, d, e, z, ldz, work, lwork, iwork, liwork, info)
          import :: dp
          character(len=1), intent(in) :: compz
@@ -207,6 +240,12 @@ module xtb_mctc_lapack_eigensolve
       real(sp), allocatable :: swork_trd(:)
       !> Whether the last subspace solve ran in FP32 (selects the back-transformation)
       logical :: last_sp = .false.
+      !> Whether the last FP32 solve was refined in FP64 (refine_block): zmat then holds every
+      !> eigenvector of X^T H X, and the back-transformation is the triangular product only
+      logical :: last_refined = .false.
+      !> FP64 workspaces of refine_block (allocated on first use)
+      real(dp), allocatable :: rhc(:, :), ry(:, :), rg(:, :), rwork(:)
+      integer, allocatable :: riwork(:)
       !> Tridiagonal reduction of the FP64 subspace solve (XTB_SCC_TRD): trd_sym (default) on
       !> the upper triangle; trd_full on a full, padded copy (apad, leading dimension ldp,
       !> 64-byte multiple), 2-12% faster per single point for one process but 2-17% less
@@ -460,6 +499,7 @@ subroutine mctc_dsygvd_fact_subspace(self, env, amat, eval, cmat, m_sub)
 
    call congruence(self, amat)
    self%last_sp = .false.
+   self%last_refined = .false.
    self%last_full = .false.
 
    if (self%trd_mode /= trd_sym) then
@@ -507,6 +547,14 @@ subroutine mctc_dsygvd_fact_backtransform(self, env, amat, cmat, ilo, ihi)
    m = ihi - ilo + 1
    if (m <= 0) return
    ldwork_trd = size(self%dwork_trd)
+
+   if (self%last_refined) then
+      ! eigenvectors of X^T H X already formed (FP32 solve refined in FP64)
+      call blas_trmm('L', 'U', 'N', 'N', self%n, m, 1.0_dp, self%dbmat, self%n, &
+         & self%zmat(:, ilo:ihi), self%n)
+      cmat(:, ilo:ihi) = self%zmat(:, ilo:ihi)
+      return
+   end if
 
    if (self%last_sp) then
       ! eigenvectors of the FP32 tridiagonal reduction, transformed in FP32
@@ -587,12 +635,15 @@ end subroutine congruence
 !> As mctc_dsygvd_fact_subspace, but the tridiagonal reduction, divide and conquer
 !> and the later back-transformation (fact_backtransform) run in FP32. Meant for the
 !> early SCC cycles only: eigenvalues and density carry FP32 errors (~1e-6 relative).
-subroutine mctc_dsygvd_fact_subspace_mixed(self, env, amat, eval)
+!> With nref > 0, the FP32 back-transformation forms every eigenvector and refine_block
+!> corrects the lowest nref (or more) in FP64, which removes those errors for them.
+subroutine mctc_dsygvd_fact_subspace_mixed(self, env, amat, eval, nref)
    character(len=*), parameter :: source = 'mctc_lapack_dsygvd_fact_subspace_mixed'
    class(TEigenSolver), intent(inout) :: self
    type(TEnvironment), intent(inout) :: env
    real(dp), intent(inout) :: amat(:, :)
    real(dp), intent(out) :: eval(:)
+   integer, intent(in), optional :: nref
    integer :: j, info
    real(sp) :: work_trd_q(1), work_orm_q(1)
 
@@ -625,7 +676,124 @@ subroutine mctc_dsygvd_fact_subspace_mixed(self, env, amat, eval)
    end if
    eval = real(self%eval_s, dp)
    self%last_sp = .true.
+   self%last_refined = .false.
+
+   if (present(nref)) then
+      if (nref > 0) then
+         call sormtr('L', 'U', 'N', self%n, self%n, self%amat_s, self%n, self%tau_s, &
+            & self%zmat_s, self%n, self%swork_trd, size(self%swork_trd), info)
+         if (info /= 0) then
+            call env%error("Failed to back-transform eigenvectors", source)
+            return
+         end if
+         self%zmat(:, :) = real(self%zmat_s, dp)
+         call refine_block(self, env, amat, eval, nref)
+      end if
+   end if
 
 end subroutine mctc_dsygvd_fact_subspace_mixed
+
+
+!> FP64 correction of the lowest k eigenpairs of A = X^T H X (upper triangle in amat) from
+!> FP32 ones (all n vectors in zmat, eigenvalues in eval). k = nref, raised until the gap
+!> to the next eigenvalue is at least 1e-3 Eh. One first-order step of each z_i against all
+!> z_j, j /= i, z_i -= sum_j z_j y_ji / (e_j - e_i) with y_ji = z_j^T (A z_i - e_i z_i) (the
+!> residual form cancels the FP32 vectors' own non-orthogonality), skipping pairs closer
+!> than 1e-3 Eh; eigenvalues from the Rayleigh quotients e_i + z_i^T r_i / z_i^T z_i of the
+!> FP32 vectors (second order); Cholesky QR; then Rayleigh-Ritz on each cluster of the
+!> skipped pairs (consecutive eigenvalues closer than 1e-3 Eh, at most a few orbitals).
+!> About 6 n^2 k flops. On dumped GFN2 matrices (scripts/kernels/fp32_error.c) the occupied
+!> subspace goes from ~2e-6 (FP32) to ~1e-9 (sine of the largest principal angle against
+!> FP64), eigenvalues from ~1e-5 to <= 5e-9 Eh. A full Rayleigh-Ritz on the block reaches
+!> 1e-11 but its k x k eigensolve costs as much as FP32 saves (scripts/kernels/refine_cost.c).
+subroutine refine_block(self, env, amat, eval, nref)
+   character(len=*), parameter :: source = 'mctc_lapack_refine_block'
+   class(TEigenSolver), intent(inout) :: self
+   type(TEnvironment), intent(inout) :: env
+   real(dp), intent(in) :: amat(:, :)
+   real(dp), intent(inout) :: eval(:)
+   integer, intent(in) :: nref
+   real(dp), parameter :: gap_min = 1.0e-3_dp
+   integer :: n, k, i, j, i0, i1, c, info, lw, liw
+   real(dp) :: g, zz, zr
+   real(dp) :: lw_q(1)
+   integer :: liw_q(1)
+
+   n = self%n
+   k = min(n, max(1, nref))
+   do while (k < n)
+      if (eval(k + 1) - eval(k) >= gap_min) exit
+      k = k + 1
+   end do
+   if (.not. allocated(self%rhc)) then
+      allocate(self%rhc(n, n), self%ry(n, n), self%rg(n, n))
+      call dsyevd('V', 'U', n, self%rg, n, eval, lw_q, -1, liw_q, -1, info)
+      allocate(self%rwork(max(1, int(lw_q(1)))), self%riwork(max(1, liw_q(1))))
+   end if
+   lw = size(self%rwork)
+   liw = size(self%riwork)
+
+   ! residual R = A Z_k - Z_k diag(e) and the Rayleigh quotients (kept in rg(:, 1))
+   call dsymm('L', 'U', n, k, 1.0_dp, amat, n, self%zmat, n, 0.0_dp, self%rhc, n)
+   do i = 1, k
+      self%rhc(:, i) = self%rhc(:, i) - eval(i) * self%zmat(:, i)
+      zz = dot_product(self%zmat(:, i), self%zmat(:, i))
+      zr = dot_product(self%zmat(:, i), self%rhc(:, i))
+      self%rg(i, 1) = eval(i) + zr / zz
+   end do
+   ! Y = Z^T R, scaled by the gaps; Z_k -= Z Y
+   call blas_gemm('T', 'N', n, k, n, 1.0_dp, self%zmat, n, self%rhc, n, 0.0_dp, self%ry, n)
+   do i = 1, k
+      do j = 1, n
+         g = eval(j) - eval(i)
+         if (j == i .or. abs(g) < gap_min) then
+            self%ry(j, i) = 0.0_dp
+         else
+            self%ry(j, i) = self%ry(j, i) / g
+         end if
+      end do
+   end do
+   self%rhc(:, 1:k) = self%zmat(:, 1:k)
+   call blas_gemm('N', 'N', n, k, n, -1.0_dp, self%zmat, n, self%ry, n, 1.0_dp, self%rhc, n)
+   self%zmat(:, 1:k) = self%rhc(:, 1:k)
+   eval(1:k) = self%rg(1:k, 1)
+   ! Cholesky QR of Z_k
+   call dsyrk('U', 'T', k, n, 1.0_dp, self%zmat, n, 0.0_dp, self%rg, n)
+   call dpotrf('U', k, self%rg, n, info)
+   if (info /= 0) then
+      call env%error("Cholesky QR failed in the FP64 refinement", source)
+      return
+   end if
+   call blas_trsm('R', 'U', 'N', 'N', n, k, 1.0_dp, self%rg, n, self%zmat, n)
+   ! Rayleigh-Ritz on each cluster of consecutive eigenvalues closer than gap_min
+   i0 = 1
+   do while (i0 <= k)
+      i1 = i0
+      do while (i1 < k)
+         if (eval(i1 + 1) - eval(i1) >= gap_min) exit
+         i1 = i1 + 1
+      end do
+      c = i1 - i0 + 1
+      if (c > 1) then
+         call dsymm('L', 'U', n, c, 1.0_dp, amat, n, self%zmat(:, i0:i1), n, 0.0_dp, &
+            & self%rhc, n)
+         call blas_gemm('T', 'N', c, c, n, 1.0_dp, self%zmat(:, i0:i1), n, self%rhc, n, &
+            & 0.0_dp, self%rg, n)
+         call dsyevd('V', 'U', c, self%rg, n, eval(i0:i1), self%rwork, lw, self%riwork, &
+            & liw, info)
+         if (info /= 0) then
+            call env%error("Rayleigh-Ritz eigensolve failed in the FP64 refinement", source)
+            return
+         end if
+         call blas_gemm('N', 'N', n, c, c, 1.0_dp, self%zmat(:, i0:i1), n, self%rg, n, &
+            & 0.0_dp, self%rhc, n)
+         self%zmat(:, i0:i1) = self%rhc(:, 1:c)
+      end if
+      i0 = i1 + 1
+   end do
+   self%last_sp = .false.
+   self%last_refined = .true.
+
+end subroutine refine_block
 
 end module xtb_mctc_lapack_eigensolve
