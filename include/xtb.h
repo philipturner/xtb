@@ -219,6 +219,19 @@ xtb_setMaxIter(xtb_TEnvironment /* env */,
                xtb_TCalculator /* calc */,
                int /* iterations */) XTB_API_SUFFIX__VERSION_2_0_0;
 
+/// Set the precision of the SCC eigensolves of an xTB (GFN1/GFN2) calculator.
+/// fp32_rmsq > 0: FP32 eigensolves while the charges change by more than fp32_rmsq (1e-3
+/// measured), then FP64; an FP32 attempt that does not converge within fp32_maxiter cycles is
+/// rerun from the same start in FP64. fp32_rmsq = 0: FP64 only (the default). fp32_refine = 1:
+/// each FP32 eigensolve refined in FP64. Invalid values are errors and change nothing.
+/// Not in upstream xtb: look the symbol up before use (dlsym) if the library may be older.
+extern XTB_API_ENTRY void XTB_API_CALL
+xtb_setSCCPrecision(xtb_TEnvironment /* env */,
+                    xtb_TCalculator /* calc */,
+                    double /* fp32_rmsq */,
+                    int /* fp32_maxiter */,
+                    int /* fp32_refine */) XTB_API_SUFFIX__VERSION_2_0_0;
+
 /// Set electronic temperature for level filling in tight binding calculators in K
 extern XTB_API_ENTRY void XTB_API_CALL
 xtb_setElectronicTemp(xtb_TEnvironment /* env */,
@@ -272,6 +285,20 @@ extern XTB_API_ENTRY void XTB_API_CALL
 xtb_getEnergy(xtb_TEnvironment /* env */,
               xtb_TResults /* res */,
               double* /* energy */) XTB_API_SUFFIX__VERSION_2_0_0;
+
+/// Query singlepoint results object for the SCC eigensolve precision used (fp32_rmsq = 0 and
+/// fp32_maxiter = 0: FP64 only) and its outcome: cycles with an FP32 eigensolve, whether the
+/// FP32 attempt was rerun in FP64 (1/0), and the SCC cycles of the run that produced the
+/// results. An error if the results hold no xTB SCC. Not in upstream xtb (see above).
+extern XTB_API_ENTRY void XTB_API_CALL
+xtb_getSCCPrecision(xtb_TEnvironment /* env */,
+                    xtb_TResults /* res */,
+                    double* /* fp32_rmsq */,
+                    int* /* fp32_maxiter */,
+                    int* /* fp32_refine */,
+                    int* /* fp32_cycles */,
+                    int* /* fp64_restart */,
+                    int* /* scc_cycles */) XTB_API_SUFFIX__VERSION_2_0_0;
 
 /// Query singlepoint results object for solvation energy in Hartree
 extern XTB_API_ENTRY void XTB_API_CALL

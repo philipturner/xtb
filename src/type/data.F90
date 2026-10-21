@@ -87,6 +87,19 @@ module xtb_type_data
       real(wp) :: g_total = 0.0_wp
       real(wp) :: gnorm = 0.0_wp
       logical  :: converged = .true.
+      !> SCC eigensolve precision actually used (xtb_setSCCPrecision): FP32 eigensolves while
+      !> the charges change by more than fp32_rmsq (0: FP64 only), the FP32 attempt capped at
+      !> fp32_maxiter cycles, refined in FP64 if fp32_refine; scc_info is set once an SCC ran
+      logical  :: scc_info = .false.
+      real(wp) :: fp32_rmsq = 0.0_wp
+      integer  :: fp32_maxiter = 0
+      logical  :: fp32_refine = .false.
+      !> cycles with an FP32 eigensolve (in the FP32 attempt, also when it was then rerun)
+      integer  :: fp32_cycles = 0
+      !> whether the FP32 attempt failed and the SCC was rerun from the same start in FP64
+      logical  :: fp64_restart = .false.
+      !> SCC cycles of the run that produced the results (the FP64 rerun's after a restart)
+      integer  :: scc_cycles = 0
       type(tb_pcem) :: pcem = tb_pcem()
       real(wp) :: e_bond = 0.0_wp
       real(wp) :: e_angl = 0.0_wp

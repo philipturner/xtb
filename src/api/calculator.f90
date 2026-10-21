@@ -43,6 +43,7 @@ module xtb_api_calculator
    public :: setSolvent_api, releaseSolvent_api
    public :: setExternalCharges_api, releaseExternalCharges_api
    public :: setAccuracy_api, setElectronicTemp_api, setMaxIter_api
+   public :: setSCCPrecision_api
 
 
    !> Void pointer to single point calculator
@@ -656,6 +657,74 @@ subroutine setMaxIter_api(venv, vcalc, maxiter) &
    end if
 
 end subroutine setMaxIter_api
+
+
+!> Set the precision of the SCC eigensolves of an xTB calculator. fp32_rmsq > 0: FP32
+!> eigensolves while the charges change by more than fp32_rmsq (1e-3 measured), then FP64; an
+!> FP32 attempt that does not converge within fp32_maxiter cycles is rerun from the same start
+!> in FP64 (bit-identical to an FP64-only run). fp32_rmsq = 0: FP64 only (the default).
+!> fp32_refine = 1: each FP32 eigensolve refined in FP64 (results within ~1e-12 Eh of FP64).
+!> Invalid values are errors and leave the calculator unchanged; xtb_getSCCPrecision on the
+!> results reports what was used.
+subroutine setSCCPrecision_api(venv, vcalc, fp32_rmsq, fp32_maxiter, fp32_refine) &
+      & bind(C, name="xtb_setSCCPrecision")
+   !DEC$ ATTRIBUTES DLLEXPORT :: setSCCPrecision_api
+   character(len=*), parameter :: source = 'xtb_api_setSCCPrecision'
+   type(c_ptr), value :: venv
+   type(VEnvironment), pointer :: env
+   type(c_ptr), value :: vcalc
+   type(VCalculator), pointer :: calc
+   real(c_double), value, intent(in) :: fp32_rmsq
+   integer(c_int), value, intent(in) :: fp32_maxiter
+   integer(c_int), value, intent(in) :: fp32_refine
+
+   if (c_associated(venv)) then
+      call c_f_pointer(venv, env)
+      call checkGlobalEnv
+
+      if (.not.c_associated(vcalc)) then
+         call env%ptr%error("Singlepoint calculator is not allocated", source)
+         return
+      end if
+      call c_f_pointer(vcalc, calc)
+
+      if (.not.allocated(calc%ptr)) then
+         call env%ptr%error("Setting SCC precision not possible, no calculator loaded", &
+            & source)
+         return
+      end if
+
+      if (.not.(fp32_rmsq >= 0.0_c_double .and. fp32_rmsq <= 1.0e+3_c_double)) then
+         call env%ptr%error("fp32_rmsq must be 0 (FP64 only) or a positive threshold", source)
+         return
+      end if
+      if (fp32_maxiter < 1) then
+         call env%ptr%error("fp32_maxiter must be at least 1", source)
+         return
+      end if
+      if (fp32_refine /= 0 .and. fp32_refine /= 1) then
+         call env%ptr%error("fp32_refine must be 0 or 1", source)
+         return
+      end if
+      if (fp32_refine == 1 .and. fp32_rmsq == 0.0_c_double) then
+         call env%ptr%error("fp32_refine needs FP32 eigensolves (fp32_rmsq > 0)", source)
+         return
+      end if
+
+      select type(xtb => calc%ptr)
+      class default
+         if (fp32_rmsq > 0.0_c_double) then
+            call env%ptr%error("FP32 eigensolves need an xTB (GFN1/GFN2) calculator", source)
+         end if
+      type is(TxTBCalculator)
+         xtb%fp32_rmsq = fp32_rmsq
+         xtb%fp32_maxiter = fp32_maxiter
+         xtb%fp32_refine = fp32_refine == 1
+      end select
+
+   end if
+
+end subroutine setSCCPrecision_api
 
 
 subroutine setElectronicTemp_api(venv, vcalc, temperature) &

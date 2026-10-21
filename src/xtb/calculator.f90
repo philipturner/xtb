@@ -71,6 +71,13 @@ module xtb_xtb_calculator
       !> Maximum number of cycles for SCC convergence
       integer :: maxiter
 
+      !> SCC eigensolve precision (xtb_setSCCPrecision): FP32 eigensolves while the charges
+      !> change by more than fp32_rmsq (0: FP64 only, the default), the FP32 attempt capped at
+      !> fp32_maxiter cycles before an FP64 rerun from the same start, optionally refined in FP64
+      real(wp) :: fp32_rmsq = 0.0_wp
+      integer :: fp32_maxiter = 160
+      logical :: fp32_refine = .false.
+
       !> External potential
       type(tb_pcem) :: pcem
 
@@ -257,7 +264,9 @@ subroutine singlepoint(self, env, mol, chk, printlevel, restart, &
       end if
       call scf(env,mol,chk%wfn,self%basis,self%pcem,self%xtbData,solvation, &
          &   hlgap,self%etemp,self%maxiter,printlevel,restart,.true., &
-         &   self%accuracy,energy,gradient,results)
+         &   self%accuracy,energy,gradient,results, &
+         &   fp32_rmsq=self%fp32_rmsq,fp32_maxiter=self%fp32_maxiter, &
+         &   fp32_refine=self%fp32_refine)
 
    case(0)
       if (allocated(self%solvation)) then

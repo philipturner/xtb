@@ -31,7 +31,7 @@ module xtb_api_results
       & getPCGradient_api, getVirial_api, getDipole_api, getCharges_api, &
       & getBondOrders_api, getNao_api, getOrbitalEigenvalues_api, &
       & getOrbitalOccupations_api, getOrbitalCoefficients_api, copyResults_api, &
-      & getSolvationEnergy_api
+      & getSolvationEnergy_api, getSCCPrecision_api
 
 
    !> Void pointer to wavefunction and result objects
@@ -44,6 +44,14 @@ module xtb_api_results
       real(wp), allocatable :: dipole(:)
       real(wp), allocatable :: egap
       real(wp), allocatable :: solvation_energy
+      !> SCC eigensolve precision used and its outcome (scc_results), set by xTB singlepoints
+      logical :: scc_info = .false.
+      real(wp) :: fp32_rmsq = 0.0_wp
+      integer :: fp32_maxiter = 0
+      logical :: fp32_refine = .false.
+      integer :: fp32_cycles = 0
+      logical :: fp64_restart = .false.
+      integer :: scc_cycles = 0
    end type VResults
 
 
@@ -136,6 +144,52 @@ subroutine getEnergy_api(venv, vres, dptr) &
    end if
 
 end subroutine getEnergy_api
+
+
+!> Query singlepoint results object for the SCC eigensolve precision used (as set with
+!> xtb_setSCCPrecision; fp32_rmsq = 0 and fp32_maxiter = 0 for FP64 only) and its outcome:
+!> cycles with an FP32 eigensolve, whether the FP32 attempt was rerun in FP64 (1) or not (0),
+!> and the SCC cycles of the run that produced the results. An error if no xTB SCC ran.
+subroutine getSCCPrecision_api(venv, vres, fp32_rmsq, fp32_maxiter, fp32_refine, &
+      & fp32_cycles, fp64_restart, scc_cycles) bind(C, name="xtb_getSCCPrecision")
+   !DEC$ ATTRIBUTES DLLEXPORT :: getSCCPrecision_api
+   character(len=*), parameter :: source = "xtb_api_getSCCPrecision"
+   type(c_ptr), value :: venv
+   type(VEnvironment), pointer :: env
+   type(c_ptr), value :: vres
+   type(VResults), pointer :: res
+   real(c_double), intent(inout) :: fp32_rmsq
+   integer(c_int), intent(inout) :: fp32_maxiter
+   integer(c_int), intent(inout) :: fp32_refine
+   integer(c_int), intent(inout) :: fp32_cycles
+   integer(c_int), intent(inout) :: fp64_restart
+   integer(c_int), intent(inout) :: scc_cycles
+
+   if (c_associated(venv)) then
+      call c_f_pointer(venv, env)
+      call checkGlobalEnv
+
+      if (.not.c_associated(vres)) then
+         call env%ptr%error("Results object is not allocated", source)
+         return
+      end if
+      call c_f_pointer(vres, res)
+
+      if (.not.res%scc_info) then
+         call env%ptr%error("SCC precision is not available in results", source)
+         return
+      end if
+
+      fp32_rmsq = res%fp32_rmsq
+      fp32_maxiter = res%fp32_maxiter
+      fp32_refine = merge(1, 0, res%fp32_refine)
+      fp32_cycles = res%fp32_cycles
+      fp64_restart = merge(1, 0, res%fp64_restart)
+      scc_cycles = res%scc_cycles
+
+   end if
+
+end subroutine getSCCPrecision_api
 
 !> Query singlepoint results object for solvation energy
 subroutine getSolvationEnergy_api(venv, vres, dptr) &

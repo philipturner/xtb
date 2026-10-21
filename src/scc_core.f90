@@ -265,7 +265,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
       &        H0,H,S,dpint,qpint,X,P,ies, &
       &        maxiter,startpdiag,scfconv,qconv, &
       &        minpr,pr, &
-      &        fail,jter,fp64_only,used_fp32)
+      &        fail,jter,fp32_rmsq,fp32_refine,fp32_cycles)
    use xtb_mctc_convert, only : autoev,evtoau
    use xtb_scc_timer
 
@@ -298,10 +298,12 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    logical, intent(in)  :: minpr
    logical, intent(in)  :: pr
    logical, intent(out) :: fail
-   !> ignore XTB_SCC_FP32_RMSQ: every eigensolve in FP64 (the restart after an FP32 run failed)
-   logical, intent(in), optional :: fp64_only
-   !> whether any eigensolve of this call ran in FP32
-   logical, intent(out), optional :: used_fp32
+   !> FP32 eigensolves while the charges change by more than this (rmsq); absent or 0: all FP64
+   real(wp), intent(in), optional :: fp32_rmsq
+   !> refine each FP32 eigensolve in FP64 (eigensolve.F90, refine_block)
+   logical, intent(in), optional :: fp32_refine
+   !> number of cycles of this call whose eigensolve ran in FP32
+   integer, intent(out), optional :: fp32_cycles
 !! ------------------------------------------------------------------------
    integer, intent(in)  :: at(n)
 !! ------------------------------------------------------------------------
@@ -415,13 +417,11 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    ! mixed precision: FP32 eigensolves while the charges still change by more than sp_rmsq
    real(wp) :: sp_rmsq
    logical  :: use_sp
-   ! XTB_SCC_FP32_REFINE=1: each FP32 eigensolve is refined in FP64 for the orbitals up to the
-   ! last occupied one (previous cycle, or the HOMO) + 32 (eigensolve.F90, refine_block)
+   ! refinement: each FP32 eigensolve is refined in FP64 for the orbitals up to the last
+   ! occupied one (previous cycle, or the HOMO) + 32 (eigensolve.F90, refine_block)
    logical  :: sp_refine
-   character(len=64) :: sp_env
-   integer  :: sp_len, sp_stat
 
-   if (present(used_fp32)) used_fp32 = .false.
+   if (present(fp32_cycles)) fp32_cycles = 0
    call scc_timer_start
    call env%check(fail)
    if (fail) return
@@ -429,21 +429,13 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    m_occ = 0
    call scc_timer_setup(ndim)
 
-   ! opt-in (XTB_SCC_FP32_RMSQ=1e-3 for example): FP32 changes the trajectory and can make fragile
-   ! runs fail to converge; scf (scf_module) then reruns the SCC in FP64 from the same start
-   ! (fp64_only). Cold runs still differ from FP64 within the gates; meant for warm starts.
+   ! FP32 eigensolves (set per calculator, xtb_setSCCPrecision; 1e-3 for example) change the
+   ! trajectory and can make fragile runs fail to converge; scf (scf_module) then reruns the
+   ! SCC in FP64 from the same start. Results stay within the production gates of FP64.
    sp_rmsq = 0.0_wp
-   call get_environment_variable('XTB_SCC_FP32_RMSQ', sp_env, length=sp_len)
-   if (sp_len > 0) then
-      read(sp_env, *, iostat=sp_stat) sp_rmsq
-      if (sp_stat /= 0) sp_rmsq = 0.0_wp
-   end if
-   if (present(fp64_only)) then
-      if (fp64_only) sp_rmsq = 0.0_wp
-   end if
-   call get_environment_variable('XTB_SCC_FP32_REFINE', sp_env, length=sp_len)
-   sp_refine = sp_len > 0
-   if (sp_refine) sp_refine = trim(sp_env) /= '0'
+   if (present(fp32_rmsq)) sp_rmsq = max(0.0_wp, fp32_rmsq)
+   sp_refine = .false.
+   if (present(fp32_refine)) sp_refine = fp32_refine
    rmsq = huge(1.0_wp)
 
    converged = .false.
@@ -509,7 +501,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    !call solve(fulldiag,ndim,ihomo,scfconv,H,S,X,P,emo,fail)
 
    use_sp = sp_rmsq > 0.0_wp .and. .not.lastdiag .and. rmsq > sp_rmsq
-   if (use_sp .and. present(used_fp32)) used_fp32 = .true.
+   if (use_sp .and. present(fp32_cycles)) fp32_cycles = fp32_cycles + 1
    if (use_sp .and. sp_refine) then
       call solver%fact_solve_subspace_mixed(env, H, emo, &
          & nref=min(ndim, max(m_occ, ihomoa, ihomob) + 32))

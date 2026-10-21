@@ -72,7 +72,8 @@ module xtb_scf
 contains
 
 subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
-      & egap, et, maxiter, prlevel, restart, grd, acc, energy, gradient, res)
+      & egap, et, maxiter, prlevel, restart, grd, acc, energy, gradient, res, &
+      & fp32_rmsq, fp32_maxiter, fp32_refine)
 
 
 ! ========================================================================
@@ -115,6 +116,12 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
    real(wp),intent(inout) :: gradient(3,mol%n)
    real(wp) :: sigma(3,3)
    type(scc_results),intent(out) :: res
+   !> SCC eigensolve precision (calculator settings, xtb_setSCCPrecision): FP32 eigensolves
+   !> while the charges change by more than fp32_rmsq (absent or 0: FP64 only), the FP32
+   !> attempt capped at fp32_maxiter cycles (default 160), optionally refined in FP64
+   real(wp), intent(in), optional :: fp32_rmsq
+   integer, intent(in), optional :: fp32_maxiter
+   logical, intent(in), optional :: fp32_refine
    type(TxTBData), intent(in) :: xtbData
    class(TSolvation), allocatable, intent(inout) :: solvation
    type(TLatticePoint) :: latp
@@ -227,17 +234,17 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
       '(10x,":",2x,a,a18,      10x,":")'
 
    logical :: exitRun
-   ! FP32 restart: the SCC's inputs, kept while XTB_SCC_FP32_RMSQ is set, to rerun it in FP64 if it fails
-   logical :: fp32_requested, used_fp32
+   ! FP32 restart: the SCC's inputs, kept while FP32 eigensolves are requested, to rerun it in FP64 if it fails
+   logical :: fp32_requested, sp_refine
+   real(wp) :: sp_rmsq
+   integer :: sp_cycles, sp_maxiter
    integer :: jter_save
-   real(wp) :: broydamp_save, gsolv_save
+   real(wp) :: gsolv_save
    real(wp), allocatable :: qq_save(:), qlmom_save(:, :), cm5_save(:)
    type(TWavefunction), allocatable :: wfn_save
    type(TxTBCoulomb), allocatable :: ies_save
    type(TxTBDispersion), allocatable :: scD4_save
    class(TSolvation), allocatable :: solvation_save
-   character(len=64) :: fp32_env
-   integer :: fp32_len, fp32_stat, fp32_maxiter
 
 !  broyden stuff
    logical  :: broy
@@ -629,21 +636,30 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
    !$acc enter data copyin(s, dpint, qpint)
 
    call init(solver, env, S)
-   ! Opt-in FP32 eigensolves (XTB_SCC_FP32_RMSQ, scc_core) change the SCC trajectory, and fragile runs can fail to
-   ! converge with them. Keep the SCC's inputs; if a run that used FP32 fails, rerun it from the same start in FP64,
-   ! which reproduces the FP64 result exactly. Meant for warm starts: a caller sets the variable around seeded calls.
-   ! The FP32 attempt stops after XTB_SCC_FP32_MAXITER cycles (default 160; converged production runs need <= 130).
-   call get_environment_variable('XTB_SCC_FP32_RMSQ', fp32_env, length=fp32_len)
-   fp32_requested = fp32_len > 0
-   used_fp32 = .false.
-   fp32_maxiter = maxiter
+   ! FP32 eigensolves (scc_core) change the SCC trajectory, and fragile runs can fail to converge with them. Keep
+   ! the SCC's inputs; if a run that used FP32 fails, rerun it from the same start in FP64, which reproduces the FP64
+   ! result exactly. The FP32 attempt stops after fp32_maxiter cycles (default 160; converged production runs need
+   ! <= 130). The settings come only from the arguments (the calculator), never from the environment. Broyden
+   ! damping (set%broydamp, process-global) isn't saved: scc never changes it (its one assignment needs iter = 0),
+   ! and writing it back would race with other threads' single points.
+   sp_rmsq = 0.0_wp
+   if (present(fp32_rmsq)) sp_rmsq = max(0.0_wp, fp32_rmsq)
+   fp32_requested = sp_rmsq > 0.0_wp
+   sp_maxiter = maxiter
    if (fp32_requested) then
-      fp32_maxiter = min(maxiter, 160)
-      call get_environment_variable('XTB_SCC_FP32_MAXITER', fp32_env, length=fp32_len)
-      if (fp32_len > 0) then
-         read(fp32_env, *, iostat=fp32_stat) fp32_maxiter
-         if (fp32_stat /= 0) fp32_maxiter = min(maxiter, 160)
-         fp32_maxiter = max(1, min(maxiter, fp32_maxiter))
+      sp_maxiter = min(maxiter, 160)
+      if (present(fp32_maxiter)) sp_maxiter = max(1, min(maxiter, fp32_maxiter))
+   end if
+   sp_refine = .false.
+   if (present(fp32_refine)) sp_refine = fp32_refine .and. fp32_requested
+   sp_cycles = 0
+   if (minpr) then
+      if (fp32_requested) then
+         write(env%unit,'(/,3x,a,es9.2,a,i0,a,a)') "SCC eigensolves: FP32 while rmsq >", sp_rmsq, &
+            & ", FP32 attempt <= ", sp_maxiter, " cycles, then FP64", &
+            & merge(" (FP32 refined in FP64)", "                       ", sp_refine)
+      else
+         write(env%unit,'(/,3x,a)') "SCC eigensolves: FP64"
       end if
    end if
    if (fp32_requested) then
@@ -655,7 +671,6 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
       qlmom_save = qlmom
       cm5_save = cm5
       gsolv_save = gsolv
-      broydamp_save = set%broydamp
       jter_save = jter
    end if
    call scc(env,xtbData,solver,mol%n,wfn%nel,wfn%nopen,basis%nao,ndp,nqp,nmat,basis%nshell, &
@@ -670,14 +685,17 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
       &     eel,ees,eaes,epol,ed,epcem,egap, &
       &     wfn%emo,wfn%ihomo,wfn%ihomoa,wfn%ihomob, &
       &     H0,wfn%C,S,dpint,qpint,X,wfn%P,ies, &
-      &     fp32_maxiter,startpdiag,scfconv,qconv, &
+      &     sp_maxiter,startpdiag,scfconv,qconv, &
       &     minpr,pr, &
-      &     fail,jter,used_fp32=used_fp32)
+      &     fail,jter,fp32_rmsq=sp_rmsq,fp32_refine=sp_refine,fp32_cycles=sp_cycles)
 
    call env%check(exitRun)
-   if (fp32_requested .and. fail .and. (used_fp32 .or. fp32_maxiter < maxiter) .and. .not.exitRun) then
-      if (pr) write(env%unit,'(/,3x,a)') &
-         "*** SCC with FP32 eigensolves did not converge: restarting in FP64 ***"
+   res%fp64_restart = .false.
+   if (fp32_requested .and. fail .and. (sp_cycles > 0 .or. sp_maxiter < maxiter) .and. .not.exitRun) then
+      if (minpr) write(env%unit,'(/,3x,a,i0,a)') &
+         "*** SCC with FP32 eigensolves did not converge in ", jter - jter_save, &
+         " cycles: restarting in FP64 ***"
+      res%fp64_restart = .true.
       wfn = wfn_save
       ies = ies_save
       if (allocated(scD4_save)) scD4 = scD4_save
@@ -689,7 +707,6 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
       qlmom = qlmom_save
       cm5 = cm5_save
       gsolv = gsolv_save
-      set%broydamp = broydamp_save
       jter = jter_save
       call scc(env,xtbData,solver,mol%n,wfn%nel,wfn%nopen,basis%nao,ndp,nqp,nmat,basis%nshell, &
          &     mol%at,matlist,mdlst,mqlst,basis%aoat2,basis%ao2sh,basis%ash, &
@@ -705,8 +722,14 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
          &     H0,wfn%C,S,dpint,qpint,X,wfn%P,ies, &
          &     maxiter,startpdiag,scfconv,qconv, &
          &     minpr,pr, &
-         &     fail,jter,fp64_only=.true.)
+         &     fail,jter,fp32_rmsq=0.0_wp)
    end if
+   res%scc_info = .true.
+   res%fp32_rmsq = sp_rmsq
+   res%fp32_maxiter = merge(sp_maxiter, 0, fp32_requested)
+   res%fp32_refine = sp_refine
+   res%fp32_cycles = sp_cycles
+   res%scc_cycles = jter
 
    !$acc exit data delete(s, dpint, qpint)
 

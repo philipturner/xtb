@@ -151,6 +151,14 @@ subroutine singlepoint_api(venv, vmol, vcalc, vres) &
 
       res%dipole = spRes%dipole
 
+      res%scc_info = spRes%scc_info
+      res%fp32_rmsq = spRes%fp32_rmsq
+      res%fp32_maxiter = spRes%fp32_maxiter
+      res%fp32_refine = spRes%fp32_refine
+      res%fp32_cycles = spRes%fp32_cycles
+      res%fp64_restart = spRes%fp64_restart
+      res%scc_cycles = spRes%scc_cycles
+
    end if
 
 end subroutine singlepoint_api
