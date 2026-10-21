@@ -268,6 +268,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
       &        fail,jter)
    use xtb_mctc_convert, only : autoev,evtoau
    use xtb_mctc_lapack_trf, only : mctc_potrf
+   use xtb_scc_timer
 
    use xtb_disp_dftd4,  only: disppot,edisp_scc
    use xtb_aespot, only : gfn2broyden_diff,gfn2broyden_out,gfn2broyden_save, &
@@ -408,9 +409,11 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    logical  :: econverged
    logical  :: qconverged
 
+   call scc_timer_start
    allocate(S_factorized(ndim, ndim), source = 0.0_wp )
    S_factorized = S
    call mctc_potrf(env, S_factorized)
+   call scc_timer_setup(ndim)
 
    converged = .false.
    lastdiag = .false.
@@ -452,6 +455,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    end if
    ! expand all atomic potentials to shell resolved potentials
    call addToShellShift(ash, atomicShift, shellShift)
+   call scc_timer_lap(stage_potential)
 
    ! build the charge dependent Hamiltonian
    if (present(aes)) then
@@ -461,6 +465,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
       call buildIsotropicH1(n,at,ndim,nshell,nmat,matlist,H,H0,S, &
          & shellShift,aoat2,ao2sh)
    end if
+   call scc_timer_lap(stage_hbuild)
 
    ! ------------------------------------------------------------------------
    ! solve HC=SCemo(X,P are scratch/store)
@@ -478,6 +483,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
       call env%error("Diagonalization of Hamiltonian failed", source)
       return
    endif
+   call scc_timer_lap(stage_eigensolve)
 
    if(ihomo+1.le.ndim.and.ihomo.ge.1)egap=emo(ihomo+1)-emo(ihomo)
    ! automatic reset to small value
@@ -501,6 +507,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
       ga = 0.0_wp
       gb = 0.0_wp
    endif
+   call scc_timer_lap(stage_fermi)
 
    ! save q
    q_in(1:nshell)=qsh(1:nshell)
@@ -511,6 +518,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
 
    ! density matrix
    call dmat(ndim,focc,H,P)
+   call scc_timer_lap(stage_dmat)
 
    ! new q
    call mpopsh(n,ndim,nshell,ao2sh,S,P,qsh)
@@ -567,6 +575,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    ! end of SCC convergence part
    qconverged = rmsq < qconv
    ! ------------------------------------------------------------------------
+   call scc_timer_lap(stage_population)
 
    ! SCC convergence acceleration
    if(.not.broy)then
@@ -617,10 +626,12 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    call qsh2qat(ash, qsh, q) !new qat
 
    if(allocated(solvation)) cm5 = q+cm5a
+   call scc_timer_lap(stage_mixing)
 
    if(minpr)write(env%unit,'(i4,F15.7,E14.6,E11.3,f8.2,2x,f8.1,l3)') &
    &  iter+jter,eel,eel-eold,rmsq,egap,omegap,fulldiag
    qq=q
+   call scc_timer_cycle(ndim, iter+jter)
 
 !  end of SCC convergence part
 
@@ -634,6 +645,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
 
    enddo scc_iterator
 
+   call scc_timer_done(ndim, min(iter,thisiter))
    jter = jter + min(iter,thisiter)
    fail = .not.converged
 
