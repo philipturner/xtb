@@ -17,6 +17,9 @@
 cmake_minimum_required(VERSION 3.17)
 option(WITH_OBJECT "To build using object library" TRUE)
 option(INSTALL_MODULES "Install Fortran module files to include directory." FALSE)
+# Link items that define xtb_dsytrd_upper and xtb_ssytrd_upper (the C ABI of src/mctc/lapack/sytrd.c), which is then
+# left out: for example a static library of Swift kernels plus the Swift runtime search paths.
+set(XTB_SYTRD_LIBRARIES "" CACHE STRING "Libraries replacing src/mctc/lapack/sytrd.c")
 
 # Buggy CMake versions
 if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.27.0 AND CMAKE_VERSION VERSION_LESS 3.28.0)
@@ -154,6 +157,7 @@ target_link_libraries(
    "lib-${PROJECT_NAME}-static"
    PUBLIC
    ${BLAS_LIBRARIES}
+   ${XTB_SYTRD_LIBRARIES}
    ${LAPACK_LIBRARIES}
    "$<$<BOOL:${WITH_OpenMP}>:OpenMP::OpenMP_Fortran>"
    "mctc-lib::mctc-lib"
@@ -193,6 +197,7 @@ if (WITH_OBJECT)
    target_link_libraries(
       "lib-${PROJECT_NAME}-shared"
       PUBLIC
+      ${XTB_SYTRD_LIBRARIES}
       ${BLAS_LIBRARIES}
       ${LAPACK_LIBRARIES}
       "$<$<BOOL:${WITH_OpenMP}>:OpenMP::OpenMP_Fortran>"

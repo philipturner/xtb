@@ -22,11 +22,14 @@ list(APPEND srcs
    "${dir}/geneigval.f90"
    "${dir}/gst.f90"
    "${dir}/stdeigval.f90"
-   "${dir}/sytrd.c"
    "${dir}/trf.f90"
    "${dir}/tri.f90"
    "${dir}/trs.f90"
    "${dir}/wrap.f90"
 )
+# XTB_SYTRD_LIBRARIES (top-level CMakeLists.txt) provides xtb_dsytrd_upper / xtb_ssytrd_upper instead
+if(NOT XTB_SYTRD_LIBRARIES)
+   list(APPEND srcs "${dir}/sytrd.c")
+endif()
 
 set(srcs ${srcs} PARENT_SCOPE)
