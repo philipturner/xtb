@@ -20,7 +20,14 @@
  * expects. The only change: on aarch64 the symmetric matrix-vector product, the
  * BLAS2 core of the reduction, is a hand-vectorized kernel that reads the triangle
  * once for four columns at a time (~50 GB/s on M1 Max against ~30 GB/s for
- * Accelerate's dsymv; dsytrd 30% faster at n = 412-776). Elsewhere it calls dsymv. */
+ * Accelerate's dsymv; dsytrd 30% faster at n = 412-776). Elsewhere it calls dsymv.
+ *
+ * xtb_dsytrd_full is the same reduction on the full matrix (both triangles stored and
+ * updated): dgemv 'T' (A^T x = A x) instead of the symmetric product, two dgemm instead of
+ * dsyr2k, two dger instead of dsyr2. Twice the arithmetic, but Accelerate's full-matrix
+ * kernels are fast enough that with a leading dimension padded to 64 bytes it is 2-19%
+ * faster at n = 412-776 (dgemv 'T' reads the matrix at 100-155 GB/s, the symmetric product
+ * at ~50). xtb_dsymmetrize_pad builds its input from the upper triangle. */
 
 #include <stddef.h>
 #if defined(__aarch64__)
@@ -40,6 +47,10 @@ extern void dlarfg_(const lint *, double *, double *, const lint *, double *);
 extern double ddot_(const lint *, const double *, const lint *, const double *, const lint *);
 extern void daxpy_(const lint *, const double *, const double *, const lint *, double *, const lint *);
 extern void dscal_(const lint *, const double *, double *, const lint *);
+extern void dgemm_(const char *, const char *, const lint *, const lint *, const lint *, const double *,
+                   const double *, const lint *, const double *, const lint *, const double *, double *, const lint *);
+extern void dger_(const lint *, const lint *, const double *, const double *, const lint *, const double *,
+                  const lint *, double *, const lint *);
 extern void sgemv_(const char *, const lint *, const lint *, const float *, const float *, const lint *,
                    const float *, const lint *, const float *, float *, const lint *);
 extern void ssymv_(const char *, const lint *, const float *, const float *, const lint *, const float *,
@@ -101,11 +112,18 @@ static void symv(lint n, double alpha, const double *A, lint lda, const double *
 #endif
 }
 
+// y = alpha A x; sym: upper triangle only, else the full matrix (as A^T x)
+static void matvec(int sym, lint n, double alpha, const double *A, lint lda, const double *x, double *y) {
+  if (sym) { symv(n, alpha, A, lda, x, y); return; }
+  double zero = 0; lint one = 1;
+  dgemv_("T", &n, &n, &alpha, A, &lda, x, &one, &zero, y, &one);
+}
+
 #define A_(i, j) a[((i) - 1) + (size_t)((j) - 1) * lda]
 #define W_(i, j) w[((i) - 1) + (size_t)((j) - 1) * ldw]
 
 // LAPACK dlatrd, UPLO = 'U'
-static void latrd_u(lint n, lint nb, double *a, lint lda, double *e, double *tau, double *w, lint ldw) {
+static void latrd_u(int sym, lint n, lint nb, double *a, lint lda, double *e, double *tau, double *w, lint ldw) {
   const double one = 1, mone = -1, zero = 0, half = 0.5; const lint i1 = 1;
   for (lint i = n; i >= n - nb + 1; i--) {
     lint iw = i - n + nb;
@@ -119,7 +137,7 @@ static void latrd_u(lint n, lint nb, double *a, lint lda, double *e, double *tau
       dlarfg_(&im1, &A_(i - 1, i), &A_(1, i), &i1, &tau[i - 2]);
       e[i - 2] = A_(i - 1, i);
       A_(i - 1, i) = one;
-      symv(im1, one, a, lda, &A_(1, i), &W_(1, iw));
+      matvec(sym, im1, one, a, lda, &A_(1, i), &W_(1, iw));
       if (i < n) {
         lint m = n - i;
         dgemv_("T", &im1, &m, &one, &W_(1, iw + 1), &ldw, &A_(1, i), &i1, &zero, &W_(i + 1, iw), &i1);
@@ -135,7 +153,7 @@ static void latrd_u(lint n, lint nb, double *a, lint lda, double *e, double *tau
 }
 
 // LAPACK dsytd2, UPLO = 'U'
-static void sytd2_u(lint n, double *a, lint lda, double *d, double *e, double *tau) {
+static void sytd2_u(int sym, lint n, double *a, lint lda, double *d, double *e, double *tau) {
   const double one = 1, mone = -1, half = 0.5; const lint i1 = 1;
   for (lint i = n - 1; i >= 1; i--) {
     double taui;
@@ -143,10 +161,14 @@ static void sytd2_u(lint n, double *a, lint lda, double *d, double *e, double *t
     e[i - 1] = A_(i, i + 1);
     if (taui != 0) {
       A_(i, i + 1) = one;
-      symv(i, taui, a, lda, &A_(1, i + 1), tau);
+      matvec(sym, i, taui, a, lda, &A_(1, i + 1), tau);
       double alpha = -half * taui * ddot_(&i, tau, &i1, &A_(1, i + 1), &i1);
       daxpy_(&i, &alpha, &A_(1, i + 1), &i1, tau, &i1);
-      dsyr2_("U", &i, &mone, &A_(1, i + 1), &i1, tau, &i1, a, &lda);
+      if (sym) dsyr2_("U", &i, &mone, &A_(1, i + 1), &i1, tau, &i1, a, &lda);
+      else {
+        dger_(&i, &i, &mone, &A_(1, i + 1), &i1, tau, &i1, a, &lda);
+        dger_(&i, &i, &mone, tau, &i1, &A_(1, i + 1), &i1, a, &lda);
+      }
       A_(i, i + 1) = e[i - 1];
     }
     d[i] = A_(i + 1, i + 1);
@@ -156,25 +178,56 @@ static void sytd2_u(lint n, double *a, lint lda, double *d, double *e, double *t
 }
 
 // LAPACK dsytrd, UPLO = 'U', nb = 32, crossover nx = 32 (ilaenv defaults); work >= n * nb
-static void sytrd_u(lint n, double *a, lint lda, double *d, double *e, double *tau, double *work) {
+static void sytrd_u(int sym, lint n, double *a, lint lda, double *d, double *e, double *tau, double *work) {
   const lint nb = 32, nx = 32; const double mone = -1, one = 1;
   lint kk = 0;
   if (n > nx) {
     kk = n - ((n - nx + nb - 1) / nb) * nb;
     for (lint i = n - nb + 1; i >= kk + 1; i -= nb) {
       lint m = i + nb - 1, im1 = i - 1;
-      latrd_u(m, nb, a, lda, e, tau, work, n);
-      dsyr2k_("U", "N", &im1, &nb, &mone, &A_(1, i), &lda, work, &n, &one, a, &lda);
+      latrd_u(sym, m, nb, a, lda, e, tau, work, n);
+      if (sym) dsyr2k_("U", "N", &im1, &nb, &mone, &A_(1, i), &lda, work, &n, &one, a, &lda);
+      else {
+        dgemm_("N", "T", &im1, &im1, &nb, &mone, &A_(1, i), &lda, work, &n, &one, a, &lda);
+        dgemm_("N", "T", &im1, &im1, &nb, &mone, work, &n, &A_(1, i), &lda, &one, a, &lda);
+      }
       for (lint j = i; j <= i + nb - 1; j++) { A_(j - 1, j) = e[j - 2]; d[j - 1] = A_(j, j); }
     }
   } else kk = n;
-  sytd2_u(kk, a, lda, d, e, tau);
+  sytd2_u(sym, kk, a, lda, d, e, tau);
 }
 
 
 /* Fortran: call xtb_dsytrd_upper(n, a, lda, d, e, tau, work), work of size n * 32 */
 void xtb_dsytrd_upper(const lint *n, double *a, const lint *lda, double *d, double *e, double *tau, double *work) {
-  sytrd_u(*n, a, *lda, d, e, tau, work);
+  sytrd_u(1, *n, a, *lda, d, e, tau, work);
+}
+
+/* Fortran: call xtb_dsytrd_full(n, a, lda, d, e, tau, work): a holds the full symmetric
+ * matrix; on return its upper triangle holds what xtb_dsytrd_upper leaves there (the lower
+ * triangle is overwritten). work of size n * 32 */
+void xtb_dsytrd_full(const lint *n, double *a, const lint *lda, double *d, double *e, double *tau, double *work) {
+  sytrd_u(0, *n, a, *lda, d, e, tau, work);
+}
+
+/* Fortran: call xtb_dsymmetrize_pad(n, src, lds, dst, ldd): dst(1:n, 1:n) = the symmetric
+ * matrix whose upper triangle is src's (src's lower triangle is not read), in 32 x 32 tiles */
+void xtb_dsymmetrize_pad(const lint *np, const double *src, const lint *ldsp, double *dst, const lint *lddp) {
+  const lint n = *np, lds = *ldsp, ldd = *lddp, tb = 32;
+  for (lint j0 = 0; j0 < n; j0 += tb) {
+    lint j1 = j0 + tb < n ? j0 + tb : n;
+    for (lint i0 = 0; i0 <= j0; i0 += tb) {
+      lint i1 = i0 + tb < n ? i0 + tb : n;
+      for (lint j = j0; j < j1; j++) {
+        lint iend = i1 < j + 1 ? i1 : j + 1;
+        for (lint i = i0; i < iend; i++) {
+          double v = src[i + (size_t)j * lds];
+          dst[i + (size_t)j * ldd] = v;
+          dst[j + (size_t)i * ldd] = v;
+        }
+      }
+    }
+  }
 }
 
 /* FP32 version for the mixed-precision SCC cycles. Same algorithm; the dot products

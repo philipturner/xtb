@@ -91,6 +91,26 @@ module xtb_mctc_lapack_eigensolve
          real(dp), intent(out) :: tau(*)
          real(dp), intent(inout) :: work(*)
       end subroutine xtb_dsytrd_upper
+      !> The same reduction on the full symmetric matrix (sytrd.c)
+      subroutine xtb_dsytrd_full(n, a, lda, d, e, tau, work) bind(c, name='xtb_dsytrd_full')
+         import :: dp
+         integer, intent(in) :: n
+         integer, intent(in) :: lda
+         real(dp), intent(inout) :: a(lda, *)
+         real(dp), intent(out) :: d(*)
+         real(dp), intent(out) :: e(*)
+         real(dp), intent(out) :: tau(*)
+         real(dp), intent(inout) :: work(*)
+      end subroutine xtb_dsytrd_full
+      !> dst(1:n, 1:n) = the symmetric matrix with src's upper triangle (sytrd.c)
+      subroutine xtb_dsymmetrize_pad(n, src, lds, dst, ldd) bind(c, name='xtb_dsymmetrize_pad')
+         import :: dp
+         integer, intent(in) :: n
+         integer, intent(in) :: lds
+         real(dp), intent(in) :: src(lds, *)
+         integer, intent(in) :: ldd
+         real(dp), intent(inout) :: dst(ldd, *)
+      end subroutine xtb_dsymmetrize_pad
       subroutine xtb_ssytrd_upper(n, a, lda, d, e, tau, work) bind(c, name='xtb_ssytrd_upper')
          import :: sp
          integer, intent(in) :: n
@@ -163,6 +183,8 @@ module xtb_mctc_lapack_eigensolve
    end interface
 
 
+   integer, parameter :: trd_sym = 0, trd_copy = 1, trd_full = 2
+
    type :: TEigenSolver
       private
       integer :: n
@@ -185,6 +207,15 @@ module xtb_mctc_lapack_eigensolve
       real(sp), allocatable :: swork_trd(:)
       !> Whether the last subspace solve ran in FP32 (selects the back-transformation)
       logical :: last_sp = .false.
+      !> Tridiagonal reduction of the FP64 subspace solve (XTB_SCC_TRD): trd_sym on the upper
+      !> triangle; trd_full on a full, padded copy (apad, leading dimension ldp, 64-byte
+      !> multiple), faster with Accelerate; trd_copy makes the copy but reduces the upper
+      !> triangle as trd_sym does (to time the copy alone)
+      integer :: trd_mode = 2
+      integer :: ldp = 0
+      real(dp), allocatable :: apad(:, :)
+      !> Whether the last FP64 subspace solve used apad (selects the back-transformation)
+      logical :: last_full = .false.
 #ifdef USE_CUSOLVER
       integer :: lwork
 #endif
@@ -271,6 +302,7 @@ subroutine initDEigenSolver(self, env, bmat)
       & self%zmat, lda, work_orm_q, -1, info)
    lwork_trd = max(1, 32*self%n, int(work_trd_q(1)), int(work_orm_q(1)))
    allocate(self%dwork_trd(lwork_trd))
+   call trd_mode_from_env(self)
 
    ! Check for Cholesky factorisation
    call mctc_potrf(env, self%dbmat)
@@ -427,8 +459,22 @@ subroutine mctc_dsygvd_fact_subspace(self, env, amat, eval, cmat, m_sub)
 
    call congruence(self, amat)
    self%last_sp = .false.
+   self%last_full = .false.
 
-   call xtb_dsytrd_upper(self%n, amat, self%n, eval, self%esub, self%tau, self%dwork_trd)
+   if (self%trd_mode /= trd_sym) then
+      if (.not. allocated(self%apad)) then
+         self%ldp = (self%n + 7) / 8 * 8
+         allocate(self%apad(self%ldp, self%n))
+      end if
+      call xtb_dsymmetrize_pad(self%n, amat, self%n, self%apad, self%ldp)
+   end if
+   if (self%trd_mode == trd_full) then
+      call xtb_dsytrd_full(self%n, self%apad, self%ldp, eval, self%esub, self%tau, &
+         & self%dwork_trd)
+      self%last_full = .true.
+   else
+      call xtb_dsytrd_upper(self%n, amat, self%n, eval, self%esub, self%tau, self%dwork_trd)
+   end if
    info = 0
    if (info == 0) then
       call dstedc('I', self%n, eval, self%esub, self%zmat, self%n, &
@@ -476,8 +522,13 @@ subroutine mctc_dsygvd_fact_backtransform(self, env, amat, cmat, ilo, ihi)
       return
    end if
 
-   call dormtr('L', 'U', 'N', self%n, m, amat, self%n, self%tau, &
-      & self%zmat(:, ilo:ihi), self%n, self%dwork_trd, ldwork_trd, info)
+   if (self%last_full) then
+      call dormtr('L', 'U', 'N', self%n, m, self%apad, self%ldp, self%tau, &
+         & self%zmat(:, ilo:ihi), self%n, self%dwork_trd, ldwork_trd, info)
+   else
+      call dormtr('L', 'U', 'N', self%n, m, amat, self%n, self%tau, &
+         & self%zmat(:, ilo:ihi), self%n, self%dwork_trd, ldwork_trd, info)
+   end if
    if (info /= 0) then
       call env%error("Failed to back-transform eigenvectors", source)
       return
@@ -487,6 +538,25 @@ subroutine mctc_dsygvd_fact_backtransform(self, env, amat, cmat, ilo, ihi)
    cmat(:, ilo:ihi) = self%zmat(:, ilo:ihi)
 
 end subroutine mctc_dsygvd_fact_backtransform
+
+
+!> XTB_SCC_TRD = sym | copy | full (default full; anything else keeps the default)
+subroutine trd_mode_from_env(self)
+   class(TEigenSolver), intent(inout) :: self
+   character(len=16) :: val
+   integer :: length, stat
+
+   self%trd_mode = trd_full
+   call get_environment_variable('XTB_SCC_TRD', val, length=length, status=stat)
+   if (stat /= 0 .or. length == 0) return
+   select case (trim(val))
+   case ('sym')
+      self%trd_mode = trd_sym
+   case ('copy')
+      self%trd_mode = trd_copy
+   end select
+
+end subroutine trd_mode_from_env
 
 
 !> Upper triangle of the congruence X^T H X (X = U^-1 in dbmat), overwriting amat
