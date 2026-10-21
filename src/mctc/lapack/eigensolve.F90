@@ -207,11 +207,12 @@ module xtb_mctc_lapack_eigensolve
       real(sp), allocatable :: swork_trd(:)
       !> Whether the last subspace solve ran in FP32 (selects the back-transformation)
       logical :: last_sp = .false.
-      !> Tridiagonal reduction of the FP64 subspace solve (XTB_SCC_TRD): trd_sym on the upper
-      !> triangle; trd_full on a full, padded copy (apad, leading dimension ldp, 64-byte
-      !> multiple), faster with Accelerate; trd_copy makes the copy but reduces the upper
-      !> triangle as trd_sym does (to time the copy alone)
-      integer :: trd_mode = 2
+      !> Tridiagonal reduction of the FP64 subspace solve (XTB_SCC_TRD): trd_sym (default) on
+      !> the upper triangle; trd_full on a full, padded copy (apad, leading dimension ldp,
+      !> 64-byte multiple), 2-12% faster per single point for one process but 2-17% less
+      !> throughput with 8 processes x 1 thread (its Accelerate kernels contend; the copy
+      !> alone doesn't); trd_copy makes the copy but reduces as trd_sym does
+      integer :: trd_mode = 0
       integer :: ldp = 0
       real(dp), allocatable :: apad(:, :)
       !> Whether the last FP64 subspace solve used apad (selects the back-transformation)
@@ -540,20 +541,20 @@ subroutine mctc_dsygvd_fact_backtransform(self, env, amat, cmat, ilo, ihi)
 end subroutine mctc_dsygvd_fact_backtransform
 
 
-!> XTB_SCC_TRD = sym | copy | full (default full; anything else keeps the default)
+!> XTB_SCC_TRD = sym | copy | full (default sym; anything else keeps the default)
 subroutine trd_mode_from_env(self)
    class(TEigenSolver), intent(inout) :: self
    character(len=16) :: val
    integer :: length, stat
 
-   self%trd_mode = trd_full
+   self%trd_mode = trd_sym
    call get_environment_variable('XTB_SCC_TRD', val, length=length, status=stat)
    if (stat /= 0 .or. length == 0) return
    select case (trim(val))
-   case ('sym')
-      self%trd_mode = trd_sym
    case ('copy')
       self%trd_mode = trd_copy
+   case ('full')
+      self%trd_mode = trd_full
    end select
 
 end subroutine trd_mode_from_env
