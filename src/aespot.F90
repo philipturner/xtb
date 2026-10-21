@@ -287,6 +287,96 @@ subroutine mmompop_gpu(nat,nao,aoat2,xyz,p,s,dpint,qpint,dipm,qp)
 end subroutine mmompop_gpu
 
 subroutine mmompop_cpu(nat,nao,aoat2,xyz,p,s,dpint,qpint,dipm,qp)
+   !> Cumulative atomic multipoles from the density. All terms are linear in P*S, P*D
+   !> and P*Q, so for every atom pair the AO-pair sums of those ten quantities are
+   !> formed first and the atomic coordinates applied once per atom pair (the AO-pair
+   !> loop does 10 multiply-adds instead of ~60 flops). Needs the AOs of each atom to
+   !> be contiguous, as in xTB's basis; otherwise mmompop_cpu_aopairs is used.
+
+   implicit none
+   integer, intent(in) :: nao,nat,aoat2(:)
+   real(wp), intent(in) :: s(:, :)
+   real(wp), intent(in) :: p(:, :)
+   real(wp), intent(in) :: dpint(:, :, :)
+   real(wp), intent(in) :: qpint(:, :, :)
+   real(wp), intent(in) :: xyz(:, :)
+   real(wp), intent(out):: dipm(:, :)
+   real(wp), intent(out):: qp(:, :)
+
+   integer :: i, j, ia, ib, jmax, first(nat), last(nat)
+   real(wp) :: pij, sm(10), smo(10), tii
+   logical :: contiguous
+
+   first = 0
+   last = -1
+   contiguous = .true.
+   do i = 1, nao
+      ia = aoat2(i)
+      if (first(ia) == 0) first(ia) = i
+      if (last(ia) /= -1 .and. last(ia) /= i - 1) contiguous = .false.
+      last(ia) = i
+   end do
+   if (.not.contiguous) then
+      call mmompop_cpu_aopairs(nat,nao,aoat2,xyz,p,s,dpint,qpint,dipm,qp)
+      return
+   end if
+
+   dipm = 0.0_wp
+   qp = 0.0_wp
+
+   !$omp parallel do default(none) schedule(dynamic) &
+   !$omp private(ia,ib,i,j,jmax,pij,sm,smo) shared(nat,first,last,p,s,dpint,qpint,xyz) &
+   !$omp reduction(+:dipm,qp)
+   do ia = 1, nat
+      if (first(ia) == 0) cycle
+      do ib = 1, ia
+         if (first(ib) == 0) cycle
+         ! sm = sums over AO pairs (i in ia, j in ib, j < i) of
+         ! [P S, P D(1:3), P Q(1:6)] (Q stored xx,yy,zz,xy,xz,yz)
+         sm = 0.0_wp
+         do i = first(ia), last(ia)
+            jmax = last(ib)
+            if (ia == ib) jmax = i - 1
+            do j = first(ib), jmax
+               pij = p(j,i)
+               sm(1) = sm(1) + pij*s(j,i)
+               sm(2:4) = sm(2:4) + pij*dpint(1:3,j,i)
+               sm(5:10) = sm(5:10) + pij*qpint(1:6,j,i)
+            end do
+         end do
+         if (ia == ib) then
+            ! off-diagonal AO pairs count for both AOs of the same atom, the
+            ! diagonal ones once
+            smo = 2.0_wp*sm
+            do i = first(ia), last(ia)
+               pij = p(i,i)
+               smo(1) = smo(1) + pij*s(i,i)
+               smo(2:4) = smo(2:4) + pij*dpint(1:3,i,i)
+               smo(5:10) = smo(5:10) + pij*qpint(1:6,i,i)
+            end do
+            call add_moments(smo, xyz(:,ia), dipm(:,ia), qp(:,ia))
+         else
+            call add_moments(sm, xyz(:,ia), dipm(:,ia), qp(:,ia))
+            call add_moments(sm, xyz(:,ib), dipm(:,ib), qp(:,ib))
+         end if
+      end do
+   end do
+   !$omp end parallel do
+
+   ! remove trace
+   do i = 1,nat
+      tii = qp(1,i)+qp(3,i)+qp(6,i)
+      tii = 0.50_wp*tii
+      qp(1:6,i) = 1.50_wp*qp(1:6,i)
+      qp(1,i) = qp(1,i)-tii
+      qp(3,i) = qp(3,i)-tii
+      qp(6,i) = qp(6,i)-tii
+   enddo
+
+
+end subroutine mmompop_cpu
+
+subroutine mmompop_cpu_aopairs(nat,nao,aoat2,xyz,p,s,dpint,qpint,dipm,qp)
 
    implicit none
    integer, intent(in) :: nao,nat,aoat2(:)
@@ -424,7 +514,25 @@ subroutine mmompop_cpu(nat,nao,aoat2,xyz,p,s,dpint,qpint,dipm,qp)
       qp(6,i) = qp(6,i)-tii
    enddo
 
-end subroutine mmompop_cpu
+end subroutine mmompop_cpu_aopairs
+
+!> Moments of one atom at r from the summed [P S, P D, P Q]; qp in lin order
+!> xx,xy,yy,xz,yz,zz
+pure subroutine add_moments(sm, r, dip, quad)
+   real(wp), intent(in) :: sm(10), r(3)
+   real(wp), intent(inout) :: dip(3), quad(6)
+   integer :: k, l, kl, kj
+   do k = 1, 3
+      dip(k) = dip(k) + r(k)*sm(1) - sm(1+k)
+      do l = 1, k-1
+         kl = k*(k-1)/2+l
+         kj = k+l+1
+         quad(kl) = quad(kl) + sm(1+k)*r(l) + sm(1+l)*r(k) - r(l)*r(k)*sm(1) - sm(4+kj)
+      end do
+      kl = k*(k+1)/2
+      quad(kl) = quad(kl) + 2.0_wp*sm(1+k)*r(k) - r(k)*r(k)*sm(1) - sm(4+k)
+   end do
+end subroutine add_moments
 end subroutine mmompop
 
 
