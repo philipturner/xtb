@@ -40,6 +40,17 @@ extern void dlarfg_(const lint *, double *, double *, const lint *, double *);
 extern double ddot_(const lint *, const double *, const lint *, const double *, const lint *);
 extern void daxpy_(const lint *, const double *, const double *, const lint *, double *, const lint *);
 extern void dscal_(const lint *, const double *, double *, const lint *);
+extern void sgemv_(const char *, const lint *, const lint *, const float *, const float *, const lint *,
+                   const float *, const lint *, const float *, float *, const lint *);
+extern void ssymv_(const char *, const lint *, const float *, const float *, const lint *, const float *,
+                   const lint *, const float *, float *, const lint *);
+extern void ssyr2k_(const char *, const char *, const lint *, const lint *, const float *, const float *,
+                    const lint *, const float *, const lint *, const float *, float *, const lint *);
+extern void ssyr2_(const char *, const lint *, const float *, const float *, const lint *, const float *,
+                   const lint *, float *, const lint *);
+extern void slarfg_(const lint *, float *, float *, const lint *, float *);
+extern void saxpy_(const lint *, const float *, const float *, const lint *, float *, const lint *);
+extern void sscal_(const lint *, const float *, float *, const lint *);
 
 #if defined(__aarch64__)
 // y = alpha * A x, A symmetric, upper triangle, n x n, column-major with lda
@@ -164,4 +175,133 @@ static void sytrd_u(lint n, double *a, lint lda, double *d, double *e, double *t
 /* Fortran: call xtb_dsytrd_upper(n, a, lda, d, e, tau, work), work of size n * 32 */
 void xtb_dsytrd_upper(const lint *n, double *a, const lint *lda, double *d, double *e, double *tau, double *work) {
   sytrd_u(*n, a, *lda, d, e, tau, work);
+}
+
+/* FP32 version for the mixed-precision SCC cycles. Same algorithm; the dot products
+ * are computed here because the legacy Fortran ABI of sdot_ (Accelerate) returns a
+ * double. */
+#if defined(__aarch64__)
+static void symv_upper_f(int n, float alpha, const float *A, int lda, const float *x, float *y) {
+  for (int i = 0; i < n; i++) y[i] = 0.0f;
+  int j0 = 0;
+  for (; j0 + 4 <= n; j0 += 4) {
+    const float *c0 = A + (size_t)j0 * lda, *c1 = c0 + lda, *c2 = c1 + lda, *c3 = c2 + lda;
+    float32x4_t x0 = vdupq_n_f32(x[j0]), x1 = vdupq_n_f32(x[j0 + 1]), x2 = vdupq_n_f32(x[j0 + 2]),
+                x3 = vdupq_n_f32(x[j0 + 3]);
+    float32x4_t s0 = vdupq_n_f32(0), s1 = s0, s2 = s0, s3 = s0;
+    int i = 0;
+    for (; i + 4 <= j0; i += 4) {
+      float32x4_t a0 = vld1q_f32(c0 + i), a1 = vld1q_f32(c1 + i), a2 = vld1q_f32(c2 + i), a3 = vld1q_f32(c3 + i);
+      float32x4_t xi = vld1q_f32(x + i), yi = vld1q_f32(y + i);
+      yi = vfmaq_f32(yi, a0, x0); yi = vfmaq_f32(yi, a1, x1); yi = vfmaq_f32(yi, a2, x2); yi = vfmaq_f32(yi, a3, x3);
+      vst1q_f32(y + i, yi);
+      s0 = vfmaq_f32(s0, a0, xi); s1 = vfmaq_f32(s1, a1, xi); s2 = vfmaq_f32(s2, a2, xi); s3 = vfmaq_f32(s3, a3, xi);
+    }
+    float t0 = vaddvq_f32(s0), t1 = vaddvq_f32(s1), t2 = vaddvq_f32(s2), t3 = vaddvq_f32(s3);
+    for (; i < j0; i++) {
+      y[i] += c0[i] * x[j0] + c1[i] * x[j0 + 1] + c2[i] * x[j0 + 2] + c3[i] * x[j0 + 3];
+      t0 += c0[i] * x[i]; t1 += c1[i] * x[i]; t2 += c2[i] * x[i]; t3 += c3[i] * x[i];
+    }
+    y[j0] += t0; y[j0 + 1] += t1; y[j0 + 2] += t2; y[j0 + 3] += t3;
+    for (int c = 0; c < 4; c++) {
+      const float *col = A + (size_t)(j0 + c) * lda;
+      for (int r = 0; r < c; r++) { y[j0 + r] += col[j0 + r] * x[j0 + c]; y[j0 + c] += col[j0 + r] * x[j0 + r]; }
+      y[j0 + c] += col[j0 + c] * x[j0 + c];
+    }
+  }
+  for (; j0 < n; j0++) {
+    const float *col = A + (size_t)j0 * lda;
+    float s = 0;
+    for (int i = 0; i < j0; i++) { y[i] += col[i] * x[j0]; s += col[i] * x[i]; }
+    y[j0] += s + col[j0] * x[j0];
+  }
+  if (alpha != 1.0f) for (int i = 0; i < n; i++) y[i] *= alpha;
+}
+#endif
+
+static void symv_f(lint n, float alpha, const float *A, lint lda, const float *x, float *y) {
+#if defined(__aarch64__)
+  symv_upper_f(n, alpha, A, lda, x, y);
+#else
+  float zero = 0; lint one = 1;
+  ssymv_("U", &n, &alpha, A, &lda, x, &one, &zero, y, &one);
+#endif
+}
+
+static float dot_f(lint n, const float *x, const float *y) {
+  float s = 0;
+  for (lint i = 0; i < n; i++) s += x[i] * y[i];
+  return s;
+}
+
+#define AF_(i, j) a[((i) - 1) + (size_t)((j) - 1) * lda]
+#define WF_(i, j) w[((i) - 1) + (size_t)((j) - 1) * ldw]
+
+static void latrd_u_f(lint n, lint nb, float *a, lint lda, float *e, float *tau, float *w, lint ldw) {
+  const float one = 1, mone = -1, zero = 0, half = 0.5f; const lint i1 = 1;
+  for (lint i = n; i >= n - nb + 1; i--) {
+    lint iw = i - n + nb;
+    if (i < n) {
+      lint m = n - i;
+      sgemv_("N", &i, &m, &mone, &AF_(1, i + 1), &lda, &WF_(i, iw + 1), &ldw, &one, &AF_(1, i), &i1);
+      sgemv_("N", &i, &m, &mone, &WF_(1, iw + 1), &ldw, &AF_(i, i + 1), &lda, &one, &AF_(1, i), &i1);
+    }
+    if (i > 1) {
+      lint im1 = i - 1;
+      slarfg_(&im1, &AF_(i - 1, i), &AF_(1, i), &i1, &tau[i - 2]);
+      e[i - 2] = AF_(i - 1, i);
+      AF_(i - 1, i) = one;
+      symv_f(im1, one, a, lda, &AF_(1, i), &WF_(1, iw));
+      if (i < n) {
+        lint m = n - i;
+        sgemv_("T", &im1, &m, &one, &WF_(1, iw + 1), &ldw, &AF_(1, i), &i1, &zero, &WF_(i + 1, iw), &i1);
+        sgemv_("N", &im1, &m, &mone, &AF_(1, i + 1), &lda, &WF_(i + 1, iw), &i1, &one, &WF_(1, iw), &i1);
+        sgemv_("T", &im1, &m, &one, &AF_(1, i + 1), &lda, &AF_(1, i), &i1, &zero, &WF_(i + 1, iw), &i1);
+        sgemv_("N", &im1, &m, &mone, &WF_(1, iw + 1), &ldw, &WF_(i + 1, iw), &i1, &one, &WF_(1, iw), &i1);
+      }
+      sscal_(&im1, &tau[i - 2], &WF_(1, iw), &i1);
+      float alpha = -half * tau[i - 2] * dot_f(im1, &WF_(1, iw), &AF_(1, i));
+      saxpy_(&im1, &alpha, &AF_(1, i), &i1, &WF_(1, iw), &i1);
+    }
+  }
+}
+
+static void sytd2_u_f(lint n, float *a, lint lda, float *d, float *e, float *tau) {
+  const float one = 1, mone = -1, half = 0.5f; const lint i1 = 1;
+  for (lint i = n - 1; i >= 1; i--) {
+    float taui;
+    slarfg_(&i, &AF_(i, i + 1), &AF_(1, i + 1), &i1, &taui);
+    e[i - 1] = AF_(i, i + 1);
+    if (taui != 0) {
+      AF_(i, i + 1) = one;
+      symv_f(i, taui, a, lda, &AF_(1, i + 1), tau);
+      float alpha = -half * taui * dot_f(i, tau, &AF_(1, i + 1));
+      saxpy_(&i, &alpha, &AF_(1, i + 1), &i1, tau, &i1);
+      ssyr2_("U", &i, &mone, &AF_(1, i + 1), &i1, tau, &i1, a, &lda);
+      AF_(i, i + 1) = e[i - 1];
+    }
+    d[i] = AF_(i + 1, i + 1);
+    tau[i - 1] = taui;
+  }
+  d[0] = AF_(1, 1);
+}
+
+static void sytrd_u_f(lint n, float *a, lint lda, float *d, float *e, float *tau, float *work) {
+  const lint nb = 32, nx = 32; const float mone = -1, one = 1;
+  lint kk = 0;
+  if (n > nx) {
+    kk = n - ((n - nx + nb - 1) / nb) * nb;
+    for (lint i = n - nb + 1; i >= kk + 1; i -= nb) {
+      lint m = i + nb - 1, im1 = i - 1;
+      latrd_u_f(m, nb, a, lda, e, tau, work, n);
+      ssyr2k_("U", "N", &im1, &nb, &mone, &AF_(1, i), &lda, work, &n, &one, a, &lda);
+      for (lint j = i; j <= i + nb - 1; j++) { AF_(j - 1, j) = e[j - 2]; d[j - 1] = AF_(j, j); }
+    }
+  } else kk = n;
+  sytd2_u_f(kk, a, lda, d, e, tau);
+}
+
+/* Fortran: call xtb_ssytrd_upper(n, a, lda, d, e, tau, work), work of size n * 32 */
+void xtb_ssytrd_upper(const lint *n, float *a, const lint *lda, float *d, float *e, float *tau, float *work) {
+  sytrd_u_f(*n, a, *lda, d, e, tau, work);
 }

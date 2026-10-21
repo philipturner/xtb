@@ -91,6 +91,16 @@ module xtb_mctc_lapack_eigensolve
          real(dp), intent(out) :: tau(*)
          real(dp), intent(inout) :: work(*)
       end subroutine xtb_dsytrd_upper
+      subroutine xtb_ssytrd_upper(n, a, lda, d, e, tau, work) bind(c, name='xtb_ssytrd_upper')
+         import :: sp
+         integer, intent(in) :: n
+         integer, intent(in) :: lda
+         real(sp), intent(inout) :: a(lda, *)
+         real(sp), intent(out) :: d(*)
+         real(sp), intent(out) :: e(*)
+         real(sp), intent(out) :: tau(*)
+         real(sp), intent(inout) :: work(*)
+      end subroutine xtb_ssytrd_upper
       pure subroutine ssytrd(uplo, n, a, lda, d, e, tau, work, lwork, info)
          import :: sp
          character(len=1), intent(in) :: uplo
@@ -523,7 +533,7 @@ subroutine mctc_dsygvd_fact_subspace_mixed(self, env, amat, eval)
          & self%tau_s, work_trd_q, -1, info)
       call sormtr('L', 'U', 'N', self%n, self%n, self%amat_s, self%n, self%tau_s, &
          & self%zmat_s, self%n, work_orm_q, -1, info)
-      allocate(self%swork_trd(max(1, self%n, int(work_trd_q(1)), int(work_orm_q(1)))))
+      allocate(self%swork_trd(max(1, 32*self%n, int(work_trd_q(1)), int(work_orm_q(1)))))
    end if
 
    call congruence(self, amat)
@@ -531,8 +541,9 @@ subroutine mctc_dsygvd_fact_subspace_mixed(self, env, amat, eval)
       self%amat_s(1:j, j) = real(amat(1:j, j), sp)
    end do
 
-   call ssytrd('U', self%n, self%amat_s, self%n, self%eval_s, self%esub_s, self%tau_s, &
-      & self%swork_trd, size(self%swork_trd), info)
+   call xtb_ssytrd_upper(self%n, self%amat_s, self%n, self%eval_s, self%esub_s, self%tau_s, &
+      & self%swork_trd)
+   info = 0
    if (info == 0) then
       call sstedc('I', self%n, self%eval_s, self%esub_s, self%zmat_s, self%n, &
          & self%swork_dc, size(self%swork_dc), self%iwork, size(self%iwork), info)
