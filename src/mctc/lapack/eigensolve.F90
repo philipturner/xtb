@@ -154,6 +154,23 @@ module xtb_mctc_lapack_eigensolve
          real(sp), intent(out) :: tau(*)
          real(sp), intent(inout) :: work(*)
       end subroutine xtb_ssytrd_upper
+      !> z = Q z with Q from xtb_dsytrd_upper, as dormtr('L', 'U', 'N') but by gemm (sytrd.c)
+      subroutine xtb_dormtr_upper(n, m, a, lda, tau, z, ldz, work) bind(c, name='xtb_dormtr_upper')
+         import :: dp
+         integer, intent(in) :: n, m, lda, ldz
+         real(dp), intent(in) :: a(lda, *)
+         real(dp), intent(in) :: tau(*)
+         real(dp), intent(inout) :: z(ldz, *)
+         real(dp), intent(inout) :: work(*)
+      end subroutine xtb_dormtr_upper
+      subroutine xtb_sormtr_upper(n, m, a, lda, tau, z, ldz, work) bind(c, name='xtb_sormtr_upper')
+         import :: sp
+         integer, intent(in) :: n, m, lda, ldz
+         real(sp), intent(in) :: a(lda, *)
+         real(sp), intent(in) :: tau(*)
+         real(sp), intent(inout) :: z(ldz, *)
+         real(sp), intent(inout) :: work(*)
+      end subroutine xtb_sormtr_upper
       pure subroutine ssytrd(uplo, n, a, lda, d, e, tau, work, lwork, info)
          import :: sp
          character(len=1), intent(in) :: uplo
@@ -230,6 +247,9 @@ module xtb_mctc_lapack_eigensolve
       real(dp), allocatable :: tau(:)
       real(dp), allocatable :: esub(:)
       real(dp), allocatable :: dwork_trd(:)
+      !> Workspaces of xtb_dormtr_upper / xtb_sormtr_upper, 32 * (4n + 32) (allocated on first use)
+      real(dp), allocatable :: dwork_orm(:)
+      real(sp), allocatable :: swork_orm(:)
       !> FP32 copies for mixed-precision SCC cycles (allocated on first use)
       real(sp), allocatable :: amat_s(:, :)
       real(sp), allocatable :: zmat_s(:, :)
@@ -542,11 +562,10 @@ subroutine mctc_dsygvd_fact_backtransform(self, env, amat, cmat, ilo, ihi)
    real(dp), intent(in) :: amat(:, :)
    real(dp), intent(inout) :: cmat(:, :)
    integer, intent(in) :: ilo, ihi
-   integer :: m, info, ldwork_trd
+   integer :: m
 
    m = ihi - ilo + 1
    if (m <= 0) return
-   ldwork_trd = size(self%dwork_trd)
 
    if (self%last_refined) then
       ! eigenvectors of X^T H X already formed (FP32 solve refined in FP64)
@@ -558,12 +577,9 @@ subroutine mctc_dsygvd_fact_backtransform(self, env, amat, cmat, ilo, ihi)
 
    if (self%last_sp) then
       ! eigenvectors of the FP32 tridiagonal reduction, transformed in FP32
-      call sormtr('L', 'U', 'N', self%n, m, self%amat_s, self%n, self%tau_s, &
-         & self%zmat_s(:, ilo:ihi), self%n, self%swork_trd, size(self%swork_trd), info)
-      if (info /= 0) then
-         call env%error("Failed to back-transform eigenvectors", source)
-         return
-      end if
+      if (.not. allocated(self%swork_orm)) allocate(self%swork_orm(32 * (4 * self%n + 32)))
+      call xtb_sormtr_upper(self%n, m, self%amat_s, self%n, self%tau_s, &
+         & self%zmat_s(:, ilo:ihi), self%n, self%swork_orm)
       self%zmat(:, ilo:ihi) = real(self%zmat_s(:, ilo:ihi), dp)
       call blas_trmm('L', 'U', 'N', 'N', self%n, m, 1.0_dp, self%dbmat, self%n, &
          & self%zmat(:, ilo:ihi), self%n)
@@ -571,16 +587,13 @@ subroutine mctc_dsygvd_fact_backtransform(self, env, amat, cmat, ilo, ihi)
       return
    end if
 
+   if (.not. allocated(self%dwork_orm)) allocate(self%dwork_orm(32 * (4 * self%n + 32)))
    if (self%last_full) then
-      call dormtr('L', 'U', 'N', self%n, m, self%apad, self%ldp, self%tau, &
-         & self%zmat(:, ilo:ihi), self%n, self%dwork_trd, ldwork_trd, info)
+      call xtb_dormtr_upper(self%n, m, self%apad, self%ldp, self%tau, &
+         & self%zmat(:, ilo:ihi), self%n, self%dwork_orm)
    else
-      call dormtr('L', 'U', 'N', self%n, m, amat, self%n, self%tau, &
-         & self%zmat(:, ilo:ihi), self%n, self%dwork_trd, ldwork_trd, info)
-   end if
-   if (info /= 0) then
-      call env%error("Failed to back-transform eigenvectors", source)
-      return
+      call xtb_dormtr_upper(self%n, m, amat, self%n, self%tau, &
+         & self%zmat(:, ilo:ihi), self%n, self%dwork_orm)
    end if
    call blas_trmm('L', 'U', 'N', 'N', self%n, m, 1.0_dp, self%dbmat, self%n, &
       & self%zmat(:, ilo:ihi), self%n)
@@ -680,12 +693,9 @@ subroutine mctc_dsygvd_fact_subspace_mixed(self, env, amat, eval, nref)
 
    if (present(nref)) then
       if (nref > 0) then
-         call sormtr('L', 'U', 'N', self%n, self%n, self%amat_s, self%n, self%tau_s, &
-            & self%zmat_s, self%n, self%swork_trd, size(self%swork_trd), info)
-         if (info /= 0) then
-            call env%error("Failed to back-transform eigenvectors", source)
-            return
-         end if
+         if (.not. allocated(self%swork_orm)) allocate(self%swork_orm(32 * (4 * self%n + 32)))
+         call xtb_sormtr_upper(self%n, self%n, self%amat_s, self%n, self%tau_s, &
+            & self%zmat_s, self%n, self%swork_orm)
          self%zmat(:, :) = real(self%zmat_s, dp)
          call refine_block(self, env, amat, eval, nref)
       end if

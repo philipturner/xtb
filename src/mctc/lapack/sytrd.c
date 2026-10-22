@@ -442,3 +442,54 @@ static void sytrd_u_f(lint n, float *a, lint lda, float *d, float *e, float *tau
 void xtb_ssytrd_upper(const lint *n, float *a, const lint *lda, float *d, float *e, float *tau, float *work) {
   sytrd_u_f(*n, a, *lda, d, e, tau, work);
 }
+
+/* Back-transformation Z = Q Z with Q from xtb_dsytrd_upper / xtb_ssytrd_upper: what
+ * xormtr('L', 'U', 'N', n, m, a, lda, tau, z, ldz) computes, in xormql's blocks of nb = 32
+ * reflectors (block i .. i + ib - 1 acts on rows 1 .. i + ib - 1, blocks in increasing i),
+ * each applied by three gemm calls instead of xlarfb: V^T stored explicitly (W = V^T Z as
+ * gemm 'N', 'N'), T from xlarft('B', 'C') made dense, W = T W, Z -= V W. Accelerate's
+ * larfb runs well below its gemm, and gemm 'T', 'N' for V^T Z below 'N', 'N' on a
+ * transposed copy: 1.2-1.4x faster than dormtr at n = 412-776, m = n / 2, one process,
+ * and 1.1-1.25x with 8 processes x 1 thread (scripts/kernels/ormtr_gemm.c). Same result up
+ * to rounding. work of size 32 * (2 * n + 2 * m + 32). */
+extern void dlarft_(const char *, const char *, const lint *, const lint *, const double *, const lint *,
+                    const double *, double *, const lint *);
+extern void slarft_(const char *, const char *, const lint *, const lint *, const float *, const lint *,
+                    const float *, float *, const lint *);
+extern void sgemm_(const char *, const char *, const lint *, const lint *, const lint *, const float *,
+                   const float *, const lint *, const float *, const lint *, const float *, float *, const lint *);
+
+#define ORMTR_UPPER(NAME, T, LARFT, GEMM)                                                         \
+void NAME(const lint *np, const lint *mp, const T *a, const lint *ldap, const T *tau, T *z,       \
+          const lint *ldzp, T *work) {                                                            \
+  const lint n = *np, m = *mp, lda = *ldap, ldz = *ldzp, nb = 32, k = n - 1;                      \
+  const T one = 1, zero = 0, mone = -1;                                                           \
+  T *v = work, *vt = v + (size_t)n * nb, *t = vt + (size_t)n * nb, *w = t + nb * nb,              \
+    *w2 = w + (size_t)nb * m;                                                                     \
+  if (m <= 0) return;                                                                             \
+  for (lint i = 1; i <= k; i += nb) {                                                             \
+    lint ib = k - i + 1 < nb ? k - i + 1 : nb, mi = i + ib - 1;                                   \
+    /* Reflector r = i + c: v(1 .. r - 1) = a(1 .. r - 1, r + 1), v(r) = 1, zero below. */        \
+    for (lint c = 0; c < ib; c++) {                                                               \
+      const T *src = a + (size_t)(i + c) * lda;                                                   \
+      T *dst = v + (size_t)c * mi;                                                                \
+      lint r = i + c;                                                                             \
+      for (lint q = 0; q < r - 1; q++) dst[q] = src[q];                                           \
+      dst[r - 1] = 1;                                                                             \
+      for (lint q = r; q < mi; q++) dst[q] = 0;                                                   \
+    }                                                                                             \
+    for (lint c = 0; c < ib; c++)                                                                 \
+      for (lint q = 0; q < mi; q++) vt[c + q * ib] = v[q + (size_t)c * mi];                       \
+    LARFT("B", "C", &mi, &ib, v, &mi, tau + i - 1, t, &ib);                                       \
+    for (lint c = 1; c < ib; c++)                                                                 \
+      for (lint q = 0; q < c; q++) t[q + c * ib] = 0;                                             \
+    GEMM("N", "N", &ib, &m, &mi, &one, vt, &ib, z, &ldz, &zero, w, &ib);                          \
+    GEMM("N", "N", &ib, &m, &ib, &one, t, &ib, w, &ib, &zero, w2, &ib);                           \
+    GEMM("N", "N", &mi, &m, &ib, &mone, v, &mi, w2, &ib, &one, z, &ldz);                          \
+  }                                                                                               \
+}
+
+/* Fortran: call xtb_dormtr_upper(n, m, a, lda, tau, z, ldz, work) */
+ORMTR_UPPER(xtb_dormtr_upper, double, dlarft_, dgemm_)
+/* Fortran: call xtb_sormtr_upper(n, m, a, lda, tau, z, ldz, work) */
+ORMTR_UPPER(xtb_sormtr_upper, float, slarft_, sgemm_)
