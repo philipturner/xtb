@@ -743,6 +743,7 @@ SYTRD_TEAM(_f, float, fmaf, slarfg_, ssyr2k_, sgemm_, symv_cols_f, panel_update_
  * Cores per cluster: hw.perflevel0.physicalcpu over its clusters, ceil(physicalcpu / cpusperl2),
  * so a cluster with disabled cores counts the enabled ones whether cpusperl2 reports enabled or
  * designed cores (6 performance cores, cpusperl2 4 or 3: 3); 4 where the sysctls are missing. */
+#if defined(_OPENMP) && defined(__aarch64__)
 enum { xtb_sytrd_team_min = 256 };
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -761,6 +762,7 @@ static int xtb_sytrd_team_max(void) {
   }
   return cached;
 }
+#endif
 
 /* Fortran: call xtb_dsytrd_upper(n, a, lda, d, e, tau, work), work of size n * 32 */
 void xtb_dsytrd_upper(const lint *n, double *a, const lint *lda, double *d, double *e, double *tau, double *work) {
