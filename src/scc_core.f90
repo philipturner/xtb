@@ -265,7 +265,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
       &        H0,H,S,dpint,qpint,X,P,ies, &
       &        maxiter,startpdiag,scfconv,qconv, &
       &        minpr,pr, &
-      &        fail,jter,fp32_rmsq,fp32_refine,fp32_cycles)
+      &        fail,jter,fp32_rmsq,fp32_refine,fp32_cycles,fp32_info)
    use xtb_mctc_convert, only : autoev,evtoau
    use xtb_scc_timer
 
@@ -304,6 +304,8 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    logical, intent(in), optional :: fp32_refine
    !> number of cycles of this call whose eigensolve ran in FP32
    integer, intent(out), optional :: fp32_cycles
+   !> LAPACK info of an FP32 eigensolve that failed (the SCC then stops unconverged), else 0
+   integer, intent(out), optional :: fp32_info
 !! ------------------------------------------------------------------------
    integer, intent(in)  :: at(n)
 !! ------------------------------------------------------------------------
@@ -417,11 +419,13 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    ! mixed precision: FP32 eigensolves while the charges still change by more than sp_rmsq
    real(wp) :: sp_rmsq
    logical  :: use_sp
+   integer  :: sp_info
    ! refinement: each FP32 eigensolve is refined in FP64 for the orbitals up to the last
    ! occupied one (previous cycle, or the HOMO) + 32 (eigensolve.F90, refine_block)
    logical  :: sp_refine
 
    if (present(fp32_cycles)) fp32_cycles = 0
+   if (present(fp32_info)) fp32_info = 0
    call scc_timer_start
    call env%check(fail)
    if (fail) return
@@ -502,13 +506,22 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
 
    use_sp = sp_rmsq > 0.0_wp .and. .not.lastdiag .and. rmsq > sp_rmsq
    if (use_sp .and. present(fp32_cycles)) fp32_cycles = fp32_cycles + 1
+   sp_info = 0
    if (use_sp .and. sp_refine) then
       call solver%fact_solve_subspace_mixed(env, H, emo, &
-         & nref=min(ndim, max(m_occ, ihomoa, ihomob) + 32))
+         & nref=min(ndim, max(m_occ, ihomoa, ihomob) + 32), stat=sp_info)
    else if (use_sp) then
-      call solver%fact_solve_subspace_mixed(env, H, emo)
+      call solver%fact_solve_subspace_mixed(env, H, emo, stat=sp_info)
    else
       call solver%fact_solve_subspace(env, H, emo)
+   end if
+   ! a failed FP32 eigensolve ends this SCC unconverged; scf (scf_module) reruns it in FP64
+   if (sp_info /= 0) then
+      if (present(fp32_info)) fp32_info = sp_info
+      call scc_timer_done(ndim, iter)
+      jter = jter + iter
+      fail = .true.
+      return
    end if
    ! the iteration printout's last column now shows FP64 (T) or FP32 (F) eigensolves
    fulldiag = .not.use_sp

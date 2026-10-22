@@ -237,7 +237,7 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
    ! FP32 restart: the SCC's inputs, kept while FP32 eigensolves are requested, to rerun it in FP64 if it fails
    logical :: fp32_requested, sp_refine
    real(wp) :: sp_rmsq
-   integer :: sp_cycles, sp_maxiter
+   integer :: sp_cycles, sp_maxiter, sp_info
    integer :: jter_save
    real(wp) :: gsolv_save
    real(wp), allocatable :: qq_save(:), qlmom_save(:, :), cm5_save(:)
@@ -637,8 +637,8 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
 
    call init(solver, env, S)
    ! FP32 eigensolves (scc_core) change the SCC trajectory, and fragile runs can fail to converge with them. Keep
-   ! the SCC's inputs; if a run that used FP32 fails, rerun it from the same start in FP64, which reproduces the FP64
-   ! result exactly. The FP32 attempt stops after fp32_maxiter cycles (default 160; converged production runs need
+   ! the SCC's inputs; if a run that used FP32 fails (no convergence, or an FP32 eigensolve fails), rerun it from the
+   ! same start in FP64, which reproduces the FP64 result exactly. The FP32 attempt stops after fp32_maxiter cycles (default 160; converged production runs need
    ! <= 130). The settings come only from the arguments (the calculator), never from the environment. Broyden
    ! damping (set%broydamp, process-global) isn't saved: scc never changes it (its one assignment needs iter = 0),
    ! and writing it back would race with other threads' single points.
@@ -687,14 +687,20 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
       &     H0,wfn%C,S,dpint,qpint,X,wfn%P,ies, &
       &     sp_maxiter,startpdiag,scfconv,qconv, &
       &     minpr,pr, &
-      &     fail,jter,fp32_rmsq=sp_rmsq,fp32_refine=sp_refine,fp32_cycles=sp_cycles)
+      &     fail,jter,fp32_rmsq=sp_rmsq,fp32_refine=sp_refine,fp32_cycles=sp_cycles,fp32_info=sp_info)
 
    call env%check(exitRun)
    res%fp64_restart = .false.
    if (fp32_requested .and. fail .and. (sp_cycles > 0 .or. sp_maxiter < maxiter) .and. .not.exitRun) then
-      if (minpr) write(env%unit,'(/,3x,a,i0,a)') &
-         "*** SCC with FP32 eigensolves did not converge in ", jter - jter_save, &
-         " cycles: restarting in FP64 ***"
+      if (minpr .and. sp_info /= 0) then
+         write(env%unit,'(/,3x,a,i0,a,i0,a)') &
+            "*** FP32 eigensolve failed in cycle ", jter - jter_save, " (info ", sp_info, &
+            "): restarting in FP64 ***"
+      else if (minpr) then
+         write(env%unit,'(/,3x,a,i0,a)') &
+            "*** SCC with FP32 eigensolves did not converge in ", jter - jter_save, &
+            " cycles: restarting in FP64 ***"
+      end if
       res%fp64_restart = .true.
       wfn = wfn_save
       ies = ies_save

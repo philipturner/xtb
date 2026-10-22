@@ -670,15 +670,21 @@ end subroutine congruence
 !> early SCC cycles only: eigenvalues and density carry FP32 errors (~1e-6 relative).
 !> With nref > 0, the FP32 back-transformation forms every eigenvector and refine_block
 !> corrects the lowest nref (or more) in FP64, which removes those errors for them.
-subroutine mctc_dsygvd_fact_subspace_mixed(self, env, amat, eval, nref)
+!> With stat present, a failure (LAPACK info, nonzero) is returned there instead of raised as
+!> an error, so the caller can redo the work in FP64. Accelerate's legacy sstedc fails on rare
+!> matrices that dstedc solves: its slaed4 doesn't converge on one root of a merge.
+subroutine mctc_dsygvd_fact_subspace_mixed(self, env, amat, eval, nref, stat)
    character(len=*), parameter :: source = 'mctc_lapack_dsygvd_fact_subspace_mixed'
    class(TEigenSolver), intent(inout) :: self
    type(TEnvironment), intent(inout) :: env
    real(dp), intent(inout) :: amat(:, :)
    real(dp), intent(out) :: eval(:)
    integer, intent(in), optional :: nref
+   integer, intent(out), optional :: stat
    integer :: j, info
    real(sp) :: work_trd_q(1), work_orm_q(1)
+
+   if (present(stat)) stat = 0
 
    if (.not. allocated(self%amat_s)) then
       allocate(self%amat_s(self%n, self%n), self%zmat_s(self%n, self%n), &
@@ -704,7 +710,13 @@ subroutine mctc_dsygvd_fact_subspace_mixed(self, env, amat, eval, nref)
          & self%swork_dc, size(self%swork_dc), self%iwork, size(self%iwork), info)
    end if
    if (info /= 0) then
-      call env%error("Failed to compute eigenvalues and eigenvectors", source)
+      self%last_sp = .false.
+      self%last_refined = .false.
+      if (present(stat)) then
+         stat = info
+      else
+         call env%error("Failed to compute eigenvalues and eigenvectors", source)
+      end if
       return
    end if
    eval = real(self%eval_s, dp)
@@ -717,7 +729,7 @@ subroutine mctc_dsygvd_fact_subspace_mixed(self, env, amat, eval, nref)
          call xtb_sormtr_upper(self%n, self%n, self%amat_s, self%n, self%tau_s, &
             & self%zmat_s, self%n, self%swork_orm)
          self%zmat(:, :) = real(self%zmat_s, dp)
-         call refine_block(self, env, amat, eval, nref)
+         call refine_block(self, env, amat, eval, nref, stat)
       end if
    end if
 
@@ -736,13 +748,15 @@ end subroutine mctc_dsygvd_fact_subspace_mixed
 !> subspace goes from ~2e-6 (FP32) to ~1e-9 (sine of the largest principal angle against
 !> FP64), eigenvalues from ~1e-5 to <= 5e-9 Eh. A full Rayleigh-Ritz on the block reaches
 !> 1e-11 but its k x k eigensolve costs as much as FP32 saves (scripts/kernels/refine_cost.c).
-subroutine refine_block(self, env, amat, eval, nref)
+!> With stat present, a failure is returned there (LAPACK info) instead of raised as an error.
+subroutine refine_block(self, env, amat, eval, nref, stat)
    character(len=*), parameter :: source = 'mctc_lapack_refine_block'
    class(TEigenSolver), intent(inout) :: self
    type(TEnvironment), intent(inout) :: env
    real(dp), intent(in) :: amat(:, :)
    real(dp), intent(inout) :: eval(:)
    integer, intent(in) :: nref
+   integer, intent(inout), optional :: stat
    real(dp), parameter :: gap_min = 1.0e-3_dp
    integer :: n, k, i, j, i0, i1, c, info, lw, liw
    real(dp) :: g, zz, zr
@@ -791,7 +805,12 @@ subroutine refine_block(self, env, amat, eval, nref)
    call dsyrk('U', 'T', k, n, 1.0_dp, self%zmat, n, 0.0_dp, self%rg, n)
    call dpotrf('U', k, self%rg, n, info)
    if (info /= 0) then
-      call env%error("Cholesky QR failed in the FP64 refinement", source)
+      self%last_refined = .false.
+      if (present(stat)) then
+         stat = info
+      else
+         call env%error("Cholesky QR failed in the FP64 refinement", source)
+      end if
       return
    end if
    call blas_trsm('R', 'U', 'N', 'N', n, k, 1.0_dp, self%rg, n, self%zmat, n)
@@ -812,7 +831,12 @@ subroutine refine_block(self, env, amat, eval, nref)
          call dsyevd('V', 'U', c, self%rg, n, eval(i0:i1), self%rwork, lw, self%riwork, &
             & liw, info)
          if (info /= 0) then
-            call env%error("Rayleigh-Ritz eigensolve failed in the FP64 refinement", source)
+            self%last_refined = .false.
+            if (present(stat)) then
+               stat = info
+            else
+               call env%error("Rayleigh-Ritz eigensolve failed in the FP64 refinement", source)
+            end if
             return
          end if
          call blas_gemm('N', 'N', n, c, c, 1.0_dp, self%zmat(:, i0:i1), n, self%rg, n, &
