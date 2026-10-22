@@ -738,16 +738,36 @@ SYTRD_TEAM(_d, double, fma, dlarfg_, dsyr2k_, dgemm_, symv_cols, panel_update_d,
 SYTRD_TEAM(_f, float, fmaf, slarfg_, ssyr2k_, sgemm_, symv_cols_f, panel_update_f, panel_dots_f, sytrd_u_f)
 #endif
 
-/* The reduction on the caller's OpenMP threads from this order up, on at most 4 of them (one
- * cluster of performance cores on the M1 Max: 6 and 8 threads were slower than 4) */
-enum { xtb_sytrd_team_min = 256, xtb_sytrd_team_max = 4 };
+/* The reduction on the caller's OpenMP threads from this order up, on at most one cluster of
+ * performance cores (on the M1 Max, 4 cores per cluster, 6 and 8 threads were slower than 4).
+ * Cores per cluster: hw.perflevel0.physicalcpu over its clusters, ceil(physicalcpu / cpusperl2),
+ * so a cluster with disabled cores counts the enabled ones whether cpusperl2 reports enabled or
+ * designed cores (6 performance cores, cpusperl2 4 or 3: 3); 4 where the sysctls are missing. */
+enum { xtb_sytrd_team_min = 256 };
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+static int xtb_sytrd_team_max(void) {
+  static int cached = 0;
+  if (cached == 0) {
+    int cores = 0, shared = 0;
+#if defined(__APPLE__)
+    size_t size = sizeof(int);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &cores, &size, NULL, 0) != 0) cores = 0;
+    size = sizeof(int);
+    if (sysctlbyname("hw.perflevel0.cpusperl2", &shared, &size, NULL, 0) != 0) shared = 0;
+#endif
+    cached = cores > 0 && shared > 0 ? cores / ((cores + shared - 1) / shared) : 4;
+  }
+  return cached;
+}
 
 /* Fortran: call xtb_dsytrd_upper(n, a, lda, d, e, tau, work), work of size n * 32 */
 void xtb_dsytrd_upper(const lint *n, double *a, const lint *lda, double *d, double *e, double *tau, double *work) {
 #if defined(_OPENMP) && defined(__aarch64__)
-  int threads = xtb_omp_threads();
+  int threads = xtb_omp_threads(), most = xtb_sytrd_team_max();
   if (threads > 1 && *n >= xtb_sytrd_team_min) {
-    sytrd_team_d(*n, a, *lda, d, e, tau, work, threads > xtb_sytrd_team_max ? xtb_sytrd_team_max : threads);
+    sytrd_team_d(*n, a, *lda, d, e, tau, work, threads > most ? most : threads);
     return;
   }
 #endif
@@ -757,9 +777,9 @@ void xtb_dsytrd_upper(const lint *n, double *a, const lint *lda, double *d, doub
 /* Fortran: call xtb_ssytrd_upper(n, a, lda, d, e, tau, work), work of size n * 32 */
 void xtb_ssytrd_upper(const lint *n, float *a, const lint *lda, float *d, float *e, float *tau, float *work) {
 #if defined(_OPENMP) && defined(__aarch64__)
-  int threads = xtb_omp_threads();
+  int threads = xtb_omp_threads(), most = xtb_sytrd_team_max();
   if (threads > 1 && *n >= xtb_sytrd_team_min) {
-    sytrd_team_f(*n, a, *lda, d, e, tau, work, threads > xtb_sytrd_team_max ? xtb_sytrd_team_max : threads);
+    sytrd_team_f(*n, a, *lda, d, e, tau, work, threads > most ? most : threads);
     return;
   }
 #endif
