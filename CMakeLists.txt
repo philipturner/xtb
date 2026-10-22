@@ -83,6 +83,10 @@ add_subdirectory("symmetry")
 if(NOT TARGET "OpenMP::OpenMP_Fortran" AND WITH_OpenMP)
   find_package("OpenMP" REQUIRED)
 endif()
+# The parallel eigensolver steps of src/mctc/lapack/sytrd.c (OpenMP tasks) need OpenMP for C too.
+if(NOT TARGET "OpenMP::OpenMP_C" AND WITH_OpenMP)
+  find_package("OpenMP" REQUIRED COMPONENTS C)
+endif()
 find_package("LAPACK" REQUIRED)
 find_package("BLAS" REQUIRED)
 
@@ -120,6 +124,7 @@ if(WITH_OBJECT)
       "$<$<BOOL:${WITH_CPCMX}>:cpcmx::cpcmx>"
       "$<$<BOOL:${WITH_TBLITE}>:tblite::tblite>"
       "$<$<BOOL:${WITH_OpenMP}>:OpenMP::OpenMP_Fortran>"
+      "$<$<BOOL:${WITH_OpenMP}>:OpenMP::OpenMP_C>"
    )
 
    # include directories

@@ -154,6 +154,26 @@ module xtb_mctc_lapack_eigensolve
          real(sp), intent(out) :: tau(*)
          real(sp), intent(inout) :: work(*)
       end subroutine xtb_ssytrd_upper
+      !> dstedc('I', ...) on the caller's OpenMP threads; dstedc itself with one (sytrd.c)
+      subroutine xtb_dstedc(n, d, e, z, ldz, work, lwork, iwork, liwork, info) bind(c, name='xtb_dstedc')
+         import :: dp
+         integer, intent(in) :: n, ldz, lwork, liwork
+         real(dp), intent(inout) :: d(*), e(*)
+         real(dp), intent(out) :: z(ldz, *)
+         real(dp), intent(inout) :: work(*)
+         integer, intent(inout) :: iwork(*)
+         integer, intent(out) :: info
+      end subroutine xtb_dstedc
+      !> sstedc('I', ...) on the caller's OpenMP threads; sstedc itself with one (sytrd.c)
+      subroutine xtb_sstedc(n, d, e, z, ldz, work, lwork, iwork, liwork, info) bind(c, name='xtb_sstedc')
+         import :: sp
+         integer, intent(in) :: n, ldz, lwork, liwork
+         real(sp), intent(inout) :: d(*), e(*)
+         real(sp), intent(out) :: z(ldz, *)
+         real(sp), intent(inout) :: work(*)
+         integer, intent(inout) :: iwork(*)
+         integer, intent(out) :: info
+      end subroutine xtb_sstedc
       !> z = Q z with Q from xtb_dsytrd_upper, as dormtr('L', 'U', 'N') but by gemm (sytrd.c)
       subroutine xtb_dormtr_upper(n, m, a, lda, tau, z, ldz, work) bind(c, name='xtb_dormtr_upper')
          import :: dp
@@ -538,7 +558,7 @@ subroutine mctc_dsygvd_fact_subspace(self, env, amat, eval, cmat, m_sub)
    end if
    info = 0
    if (info == 0) then
-      call dstedc('I', self%n, eval, self%esub, self%zmat, self%n, &
+      call xtb_dstedc(self%n, eval, self%esub, self%zmat, self%n, &
          & self%dwork, ldwork, self%iwork, liwork, info)
    end if
    if (info /= 0) then
@@ -680,7 +700,7 @@ subroutine mctc_dsygvd_fact_subspace_mixed(self, env, amat, eval, nref)
       & self%swork_trd)
    info = 0
    if (info == 0) then
-      call sstedc('I', self%n, self%eval_s, self%esub_s, self%zmat_s, self%n, &
+      call xtb_sstedc(self%n, self%eval_s, self%esub_s, self%zmat_s, self%n, &
          & self%swork_dc, size(self%swork_dc), self%iwork, size(self%iwork), info)
    end if
    if (info /= 0) then

@@ -31,7 +31,20 @@
  * faster at n = 412-776 (dgemv 'T' reads the matrix at 100-155 GB/s, the symmetric product
  * at ~50). xtb_dsymmetrize_pad builds its input from the upper triangle. */
 
+#include <math.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#define XTB_OMP_PRAGMA(x) _Pragma(#x)
+/* The OpenMP threads the calling thread would get (its own ICV, which omp_set_num_threads
+ * sets), or 1 inside a parallel region. */
+static int xtb_omp_threads(void) { return omp_in_parallel() ? 1 : omp_get_max_threads(); }
+#else
+#define XTB_OMP_PRAGMA(x)
+static int xtb_omp_threads(void) { return 1; }
+#endif
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
@@ -576,8 +589,8 @@ extern void sgemm_(const char *, const char *, const lint *, const lint *, const
                    const float *, const lint *, const float *, const lint *, const float *, float *, const lint *);
 
 #define ORMTR_UPPER(NAME, T, LARFT, GEMM)                                                         \
-void NAME(const lint *np, const lint *mp, const T *a, const lint *ldap, const T *tau, T *z,       \
-          const lint *ldzp, T *work) {                                                            \
+static void NAME##_serial(const lint *np, const lint *mp, const T *a, const lint *ldap,           \
+                          const T *tau, T *z, const lint *ldzp, T *work) {                        \
   const lint n = *np, m = *mp, lda = *ldap, ldz = *ldzp, nb = 32, k = n - 1;                      \
   const T one = 1, zero = 0, mone = -1;                                                           \
   T *v = work, *vt = v + (size_t)n * nb, *t = vt + (size_t)n * nb, *w = t + nb * nb,              \
@@ -605,7 +618,222 @@ void NAME(const lint *np, const lint *mp, const T *a, const lint *ldap, const T 
   }                                                                                               \
 }
 
-/* Fortran: call xtb_dormtr_upper(n, m, a, lda, tau, z, ldz, work) */
 ORMTR_UPPER(xtb_dormtr_upper, double, dlarft_, dgemm_)
-/* Fortran: call xtb_sormtr_upper(n, m, a, lda, tau, z, ldz, work) */
 ORMTR_UPPER(xtb_sormtr_upper, float, slarft_, sgemm_)
+
+/* With more than one OpenMP thread available to the caller (and not already inside a parallel
+ * region), the columns of z are split into two blocks on two threads, each with its own
+ * workspace; the blocks are independent. Two, not more: the blocks' gemm calls share the AMX
+ * unit of a core cluster, and 4 or 8 threads were mostly slower than 2 (scripts/kernels/
+ * stedc_omp.c, M1 Max, m = n / 2: 1.25-1.9x with 2 at n = 412-1788). Otherwise the serial
+ * routine with the caller's work. */
+#define ORMTR_UPPER_ENTRY(NAME, T)                                                                \
+void NAME(const lint *np, const lint *mp, const T *a, const lint *ldap, const T *tau, T *z,       \
+          const lint *ldzp, T *work) {                                                            \
+  int threads = xtb_omp_threads() > 1 ? 2 : 1;                                                    \
+  lint m = *mp;                                                                                   \
+  if (threads <= 1 || m < 2 * threads) { NAME##_serial(np, mp, a, ldap, tau, z, ldzp, work); return; } \
+  lint width = (m + threads - 1) / threads, blocks = (m + width - 1) / width;                     \
+  XTB_OMP_PRAGMA(omp parallel for num_threads(threads) schedule(static, 1))                       \
+  for (lint blk = 0; blk < blocks; blk++) {                                                       \
+    lint c0 = blk * width, cols = m - c0 < width ? m - c0 : width;                                \
+    T *w = malloc(sizeof(T) * 32 * (2 * (size_t)*np + 2 * (size_t)cols + 32));                   \
+    NAME##_serial(np, &cols, a, ldap, tau, z + (size_t)c0 * *ldzp, ldzp, w);                      \
+    free(w);                                                                                      \
+  }                                                                                               \
+}
+
+/* Fortran: call xtb_dormtr_upper(n, m, a, lda, tau, z, ldz, work) */
+ORMTR_UPPER_ENTRY(xtb_dormtr_upper, double)
+/* Fortran: call xtb_sormtr_upper(n, m, a, lda, tau, z, ldz, work) */
+ORMTR_UPPER_ENTRY(xtb_sormtr_upper, float)
+
+/* Divide and conquer for the symmetric tridiagonal eigenproblem (all eigenvectors, as
+ * xstedc('I')) on the caller's OpenMP threads. With one thread (or inside a parallel region,
+ * or n < 256) this is xstedc itself, bit for bit. Otherwise the top levels of the recursion run
+ * here as OpenMP tasks: each level tears the matrix at n1 = n / 2 (a rank-one change, as
+ * LAPACK's dlaed0), solves both halves at once, and merges them as dlaed1 does: deflation by
+ * xlaed2, then dlaed3's steps with their independent parts as task loops (one xlaed4 call per
+ * root, the stabilized eigenvectors of the rank-one problem per column, the gemm that forms
+ * the merged eigenvectors per block of columns). The leaves are xstedc. Calls that can run
+ * concurrently use Accelerate's new LAPACK interface ($NEWLAPACK), documented as thread-safe.
+ * Q2 is n^2: xlaed2 stores the deflated vectors there with leading dimension n, beyond the
+ * n1^2 + n2^2 its documentation gives (an overrun found by AddressSanitizer at n = 1788).
+ * Same arguments as xstedc with COMPZ = 'I' (work and iwork are used only by the serial path).
+ * The Swift implementation this ports: Sources/Diagonalization/Stages/ParallelDivideAndConquer.swift
+ * in the parent repository (eigensolve alone, M1 Max, 8 threads: dstedc 2.3-2.8x faster at
+ * n = 412-1788). */
+#if defined(__APPLE__)
+#define XTB_TS(name) __asm__("_" #name "$NEWLAPACK")
+#else
+#define XTB_TS(name) __asm__(#name "_")
+#endif
+extern void dstedc_ts(const char *, const lint *, double *, double *, double *, const lint *, double *,
+                      const lint *, lint *, const lint *, lint *) XTB_TS(dstedc);
+extern void sstedc_ts(const char *, const lint *, float *, float *, float *, const lint *, float *,
+                      const lint *, lint *, const lint *, lint *) XTB_TS(sstedc);
+extern void dlaed2_ts(lint *, const lint *, const lint *, double *, double *, const lint *, lint *, double *,
+                      double *, double *, double *, double *, lint *, lint *, lint *, lint *, lint *) XTB_TS(dlaed2);
+extern void slaed2_ts(lint *, const lint *, const lint *, float *, float *, const lint *, lint *, float *,
+                      float *, float *, float *, float *, lint *, lint *, lint *, lint *, lint *) XTB_TS(slaed2);
+extern void dlaed4_ts(const lint *, const lint *, const double *, const double *, double *, const double *,
+                      double *, lint *) XTB_TS(dlaed4);
+extern void slaed4_ts(const lint *, const lint *, const float *, const float *, float *, const float *,
+                      float *, lint *) XTB_TS(slaed4);
+extern void dlamrg_ts(const lint *, const lint *, const double *, const lint *, const lint *, lint *) XTB_TS(dlamrg);
+extern void slamrg_ts(const lint *, const lint *, const float *, const lint *, const lint *, lint *) XTB_TS(slamrg);
+extern void dstedc_(const char *, const lint *, double *, double *, double *, const lint *, double *, const lint *,
+                    lint *, const lint *, lint *);
+extern void sstedc_(const char *, const lint *, float *, float *, float *, const lint *, float *, const lint *,
+                    lint *, const lint *, lint *);
+
+#define STEDC_PARALLEL(P, T, GEMM)                                                                \
+static lint P##dc_leaf(lint n, T *d, T *e, T *q, lint ldq) {                                      \
+  lint lwork = 1 + 4 * n + n * n, liwork = 3 + 5 * n, info = 0;                                   \
+  T *work = malloc(sizeof(T) * (size_t)lwork);                                                    \
+  lint *iwork = malloc(sizeof(lint) * (size_t)liwork);                                            \
+  P##stedc_ts("I", &n, d, e, q, &ldq, work, &lwork, iwork, &liwork, &info);                       \
+  free(work); free(iwork);                                                                        \
+  return info;                                                                                    \
+}                                                                                                 \
+/* dlaed3: the k roots (into d), the rank-one problem's eigenvectors, q(:, 0:k) = Q2 S. */        \
+static lint P##dc_secular(lint k, lint n, lint n1, T *d, T *q, lint ldq, T rho, T *dlamda,       \
+                          const T *q2, const lint *indx, const lint *ctot, T *w) {                \
+  lint bad = 0;                                                                                   \
+  XTB_OMP_PRAGMA(omp taskloop grainsize(8) shared(bad))                                           \
+  for (lint j = 0; j < k; j++) {                                                                  \
+    lint jj = j + 1, info = 0;                                                                    \
+    P##laed4_ts(&k, &jj, dlamda, w, q + (size_t)j * ldq, &rho, d + j, &info);                     \
+    if (info) { XTB_OMP_PRAGMA(omp atomic write) bad = info; }                                    \
+  }                                                                                               \
+  if (bad) return bad;                                                                            \
+  if (k == 2) {                                                                                   \
+    for (lint j = 0; j < 2; j++) {                                                                \
+      T pair[2] = {q[(size_t)j * ldq], q[1 + (size_t)j * ldq]};                                   \
+      q[(size_t)j * ldq] = pair[indx[0] - 1]; q[1 + (size_t)j * ldq] = pair[indx[1] - 1];         \
+    }                                                                                             \
+  } else if (k > 2) {                                                                             \
+    T *sg = malloc(sizeof(T) * 2 * (size_t)k), *wn = sg + k;                                      \
+    memcpy(sg, w, sizeof(T) * (size_t)k);                                                         \
+    /* z recomputed from the roots, each i on its own, in dlaed3's product order. */              \
+    XTB_OMP_PRAGMA(omp taskloop grainsize(16))                                                    \
+    for (lint i = 0; i < k; i++) {                                                                \
+      T prod = q[i + (size_t)i * ldq];                                                            \
+      for (lint j = 0; j < k; j++)                                                                \
+        if (j != i) prod *= q[i + (size_t)j * ldq] / (dlamda[i] - dlamda[j]);                     \
+      T mag = sqrt(-prod);                                                                        \
+      wn[i] = sg[i] < 0 ? -mag : mag;                                                             \
+    }                                                                                             \
+    XTB_OMP_PRAGMA(omp taskloop grainsize(16))                                                    \
+    for (lint j = 0; j < k; j++) {                                                                \
+      T *col = q + (size_t)j * ldq, *sv = malloc(sizeof(T) * (size_t)k), sum = 0;                 \
+      for (lint i = 0; i < k; i++) { sv[i] = wn[i] / col[i]; sum += sv[i] * sv[i]; }              \
+      T scale = 1 / sqrt(sum);                                                                    \
+      for (lint i = 0; i < k; i++) col[i] = sv[indx[i] - 1] * scale;                              \
+      free(sv);                                                                                   \
+    }                                                                                             \
+    free(sg);                                                                                     \
+  }                                                                                               \
+  lint n2 = n - n1, c0 = ctot[0], n12 = ctot[0] + ctot[1], n23 = ctot[1] + ctot[2];               \
+  lint width = 64, blocks = (k + width - 1) / width;                                              \
+  XTB_OMP_PRAGMA(omp taskloop grainsize(1))                                                       \
+  for (lint blk = 0; blk < blocks; blk++) {                                                       \
+    lint j0 = blk * width, cols = k - j0 < width ? k - j0 : width;                                \
+    lint big = n12 > n23 ? n12 : n23;                                                             \
+    T *sm = malloc(sizeof(T) * (size_t)(big > 0 ? big : 1) * cols), one = 1, zero = 0;            \
+    for (lint j = 0; j < cols; j++)                                                               \
+      memcpy(sm + (size_t)j * n23, q + c0 + (size_t)(j0 + j) * ldq, sizeof(T) * (size_t)n23);     \
+    if (n23 > 0) GEMM("N", "N", &n2, &cols, &n23, &one, q2 + (size_t)n1 * n12, &n2, sm, &n23,     \
+                      &zero, q + n1 + (size_t)j0 * ldq, &ldq);                                    \
+    else for (lint j = 0; j < cols; j++) memset(q + n1 + (size_t)(j0 + j) * ldq, 0, sizeof(T) * (size_t)n2); \
+    for (lint j = 0; j < cols; j++)                                                               \
+      memcpy(sm + (size_t)j * n12, q + (size_t)(j0 + j) * ldq, sizeof(T) * (size_t)n12);          \
+    if (n12 > 0) GEMM("N", "N", &n1, &cols, &n12, &one, q2, &n1, sm, &n12, &zero,                 \
+                      q + (size_t)j0 * ldq, &ldq);                                                \
+    else for (lint j = 0; j < cols; j++) memset(q + (size_t)(j0 + j) * ldq, 0, sizeof(T) * (size_t)n1); \
+    free(sm);                                                                                     \
+  }                                                                                               \
+  return 0;                                                                                       \
+}                                                                                                 \
+/* dlaed1, then the result sorted ascending (as the next level up expects). */                    \
+static lint P##dc_merge(lint n, lint n1, T *d, T *q, lint ldq, T rho) {                           \
+  lint n2 = n - n1, k = 0, info = 0;                                                              \
+  T *z = malloc(sizeof(T) * (3 * (size_t)n + (size_t)n * n)), *dlamda = z + n, *w = dlamda + n,  \
+    *q2 = w + n;                                                                                  \
+  lint *iw = malloc(sizeof(lint) * 5 * (size_t)n), *indxq = iw, *indx = iw + n, *indxc = indx + n, \
+       *indxp = indxc + n, *coltyp = indxp + n;                                                   \
+  for (lint i = 0; i < n1; i++) indxq[i] = i + 1;                                                 \
+  for (lint i = 0; i < n2; i++) indxq[n1 + i] = i + 1;                                            \
+  for (lint i = 0; i < n1; i++) z[i] = q[(n1 - 1) + (size_t)i * ldq];                             \
+  for (lint i = 0; i < n2; i++) z[n1 + i] = q[n1 + (size_t)(n1 + i) * ldq];                       \
+  P##laed2_ts(&k, &n, &n1, d, q, &ldq, indxq, &rho, z, dlamda, w, q2, indx, indxc, indxp, coltyp, \
+              &info);                                                                             \
+  if (!info && k > 0) {                                                                           \
+    info = P##dc_secular(k, n, n1, d, q, ldq, rho, dlamda, q2, indxc, coltyp, w);                 \
+    lint nk = n - k, up = 1, down = -1;                                                           \
+    if (!info) P##lamrg_ts(&k, &nk, d, &up, &down, indxq);                                        \
+  } else if (!info) {                                                                             \
+    for (lint i = 0; i < n; i++) indxq[i] = i + 1;                                                \
+  }                                                                                               \
+  if (!info) {                                                                                    \
+    T *sorted = malloc(sizeof(T) * ((size_t)n * n + n)), *ds = sorted + (size_t)n * n;            \
+    for (lint i = 0; i < n; i++) ds[i] = d[indxq[i] - 1];                                         \
+    XTB_OMP_PRAGMA(omp taskloop grainsize(32))                                                    \
+    for (lint i = 0; i < n; i++)                                                                  \
+      memcpy(sorted + (size_t)i * n, q + (size_t)(indxq[i] - 1) * ldq, sizeof(T) * (size_t)n);    \
+    XTB_OMP_PRAGMA(omp taskloop grainsize(32))                                                    \
+    for (lint i = 0; i < n; i++)                                                                  \
+      memcpy(q + (size_t)i * ldq, sorted + (size_t)i * n, sizeof(T) * (size_t)n);                 \
+    memcpy(d, ds, sizeof(T) * (size_t)n);                                                         \
+    free(sorted);                                                                                 \
+  }                                                                                               \
+  free(z); free(iw);                                                                              \
+  return info;                                                                                    \
+}                                                                                                 \
+static lint P##dc_level(lint n, T *d, T *e, T *q, lint ldq, int depth) {                          \
+  if (depth <= 0 || n < 128) return P##dc_leaf(n, d, e, q, ldq);                                 \
+  lint n1 = n / 2, n2 = n - n1, i1 = 0, i2 = 0;                                                   \
+  T rho = e[n1 - 1];                                                                              \
+  d[n1 - 1] -= fabs(rho);                                                                         \
+  d[n1] -= fabs(rho);                                                                             \
+  XTB_OMP_PRAGMA(omp task shared(i1))                                                             \
+  i1 = P##dc_level(n1, d, e, q, ldq, depth - 1);                                                  \
+  XTB_OMP_PRAGMA(omp task shared(i2))                                                             \
+  i2 = P##dc_level(n2, d + n1, e + n1, q + n1 + (size_t)n1 * ldq, ldq, depth - 1);                \
+  XTB_OMP_PRAGMA(omp taskwait)                                                                    \
+  if (i1) return i1;                                                                              \
+  if (i2) return i2 + n1;                                                                         \
+  return P##dc_merge(n, n1, d, q, ldq, rho);                                                      \
+}                                                                                                 \
+void xtb_##P##stedc(const lint *np, T *d, T *e, T *z, const lint *ldzp, T *work, const lint *lwork, \
+                    lint *iwork, const lint *liwork, lint *info) {                                \
+  lint n = *np, ldz = *ldzp;                                                                      \
+  int threads = xtb_omp_threads();                                                                \
+  if (threads <= 1 || n < 256) {                                                                  \
+    P##stedc_("I", np, d, e, z, ldzp, work, lwork, iwork, liwork, info);                          \
+    return;                                                                                       \
+  }                                                                                               \
+  /* Scale to unit max norm, as xstedc does before dlaed0. */                                     \
+  T norm = 0;                                                                                     \
+  for (lint i = 0; i < n; i++) norm = fabs(d[i]) > norm ? fabs(d[i]) : norm;                      \
+  for (lint i = 0; i < n - 1; i++) norm = fabs(e[i]) > norm ? fabs(e[i]) : norm;                  \
+  for (lint j = 0; j < n; j++) memset(z + (size_t)j * ldz, 0, sizeof(T) * (size_t)n);            \
+  *info = 0;                                                                                      \
+  if (norm == 0) { for (lint i = 0; i < n; i++) z[i + (size_t)i * ldz] = 1; return; }             \
+  for (lint i = 0; i < n; i++) d[i] /= norm;                                                      \
+  for (lint i = 0; i < n - 1; i++) e[i] /= norm;                                                  \
+  int depth = 0;                                                                                  \
+  while ((1 << depth) < threads) depth++;                                                         \
+  lint result = 0;                                                                                \
+  XTB_OMP_PRAGMA(omp parallel num_threads(threads))                                               \
+  XTB_OMP_PRAGMA(omp single)                                                                      \
+  result = P##dc_level(n, d, e, z, ldz, depth);                                                   \
+  *info = result;                                                                                 \
+  for (lint i = 0; i < n; i++) d[i] *= norm;                                                      \
+}
+extern void sgemm_(const char *, const char *, const lint *, const lint *, const lint *, const float *,
+                   const float *, const lint *, const float *, const lint *, const float *, float *, const lint *);
+/* Fortran: call xtb_dstedc(n, d, e, z, ldz, work, lwork, iwork, liwork, info), as dstedc('I', ...) */
+STEDC_PARALLEL(d, double, dgemm_)
+/* Fortran: call xtb_sstedc(n, d, e, z, ldz, work, lwork, iwork, liwork, info), as sstedc('I', ...) */
+STEDC_PARALLEL(s, float, sgemm_)
