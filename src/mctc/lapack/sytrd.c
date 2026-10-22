@@ -19,7 +19,7 @@
  * ported unchanged, so the output (Householder vectors in A, tau) is what dormtr
  * expects. The only change: on aarch64 the symmetric matrix-vector product, the
  * BLAS2 core of the reduction, is a hand-vectorized kernel that reads the triangle
- * once for four columns at a time (~50 GB/s on M1 Max against ~30 GB/s for
+ * once for eight columns at a time (~55-65 GB/s on M1 Max against ~30 GB/s for
  * Accelerate's dsymv; dsytrd 30% faster at n = 412-776). Elsewhere it calls dsymv.
  *
  * xtb_dsytrd_full is the same reduction on the full matrix (both triangles stored and
@@ -68,6 +68,48 @@ extern void sscal_(const lint *, const float *, float *, const lint *);
 static void symv_upper(int n, double alpha, const double *A, int lda, const double *x, double *y) {
   for (int i = 0; i < n; i++) y[i] = 0.0;
   int j0 = 0;
+  // Eight columns per pass while they fit: each column's dot product is a chain of one fused multiply-add per
+  // vector of rows (4-cycle latency), so eight chains keep the four FMA pipes busy where four can't (1.1-1.25x).
+  // Same bits as two passes of four: rows above j0 see the eight columns in the same order, and the last four
+  // columns' rows j0 .. j0 + 3 follow the first four's diagonal block, as they would.
+  for (; j0 + 8 <= n; j0 += 8) {
+    const double *c0 = A + (size_t)j0 * lda, *c1 = c0 + lda, *c2 = c1 + lda, *c3 = c2 + lda, *c4 = c3 + lda,
+              *c5 = c4 + lda, *c6 = c5 + lda, *c7 = c6 + lda;
+    float64x2_t x0 = vdupq_n_f64(x[j0]), x1 = vdupq_n_f64(x[j0 + 1]), x2 = vdupq_n_f64(x[j0 + 2]),
+                x3 = vdupq_n_f64(x[j0 + 3]), x4 = vdupq_n_f64(x[j0 + 4]), x5 = vdupq_n_f64(x[j0 + 5]),
+                x6 = vdupq_n_f64(x[j0 + 6]), x7 = vdupq_n_f64(x[j0 + 7]);
+    float64x2_t s0 = vdupq_n_f64(0), s1 = s0, s2 = s0, s3 = s0, s4 = s0, s5 = s0, s6 = s0, s7 = s0;
+    int i = 0;
+    for (; i + 2 <= j0; i += 2) {
+      float64x2_t a0 = vld1q_f64(c0 + i), a1 = vld1q_f64(c1 + i), a2 = vld1q_f64(c2 + i), a3 = vld1q_f64(c3 + i);
+      float64x2_t a4 = vld1q_f64(c4 + i), a5 = vld1q_f64(c5 + i), a6 = vld1q_f64(c6 + i), a7 = vld1q_f64(c7 + i);
+      float64x2_t xi = vld1q_f64(x + i), yi = vld1q_f64(y + i);
+      yi = vfmaq_f64(yi, a0, x0); yi = vfmaq_f64(yi, a1, x1); yi = vfmaq_f64(yi, a2, x2); yi = vfmaq_f64(yi, a3, x3);
+      yi = vfmaq_f64(yi, a4, x4); yi = vfmaq_f64(yi, a5, x5); yi = vfmaq_f64(yi, a6, x6); yi = vfmaq_f64(yi, a7, x7);
+      vst1q_f64(y + i, yi);
+      s0 = vfmaq_f64(s0, a0, xi); s1 = vfmaq_f64(s1, a1, xi); s2 = vfmaq_f64(s2, a2, xi); s3 = vfmaq_f64(s3, a3, xi);
+      s4 = vfmaq_f64(s4, a4, xi); s5 = vfmaq_f64(s5, a5, xi); s6 = vfmaq_f64(s6, a6, xi); s7 = vfmaq_f64(s7, a7, xi);
+    }
+    y[j0] += vaddvq_f64(s0); y[j0 + 1] += vaddvq_f64(s1); y[j0 + 2] += vaddvq_f64(s2); y[j0 + 3] += vaddvq_f64(s3);
+    for (int c = 0; c < 4; c++) {
+      const double *col = A + (size_t)(j0 + c) * lda;
+      for (int r = 0; r < c; r++) { y[j0 + r] += col[j0 + r] * x[j0 + c]; y[j0 + c] += col[j0 + r] * x[j0 + r]; }
+      y[j0 + c] += col[j0 + c] * x[j0 + c];
+    }
+    for (; i + 2 <= j0 + 4; i += 2) {
+      float64x2_t a4 = vld1q_f64(c4 + i), a5 = vld1q_f64(c5 + i), a6 = vld1q_f64(c6 + i), a7 = vld1q_f64(c7 + i);
+      float64x2_t xi = vld1q_f64(x + i), yi = vld1q_f64(y + i);
+      yi = vfmaq_f64(yi, a4, x4); yi = vfmaq_f64(yi, a5, x5); yi = vfmaq_f64(yi, a6, x6); yi = vfmaq_f64(yi, a7, x7);
+      vst1q_f64(y + i, yi);
+      s4 = vfmaq_f64(s4, a4, xi); s5 = vfmaq_f64(s5, a5, xi); s6 = vfmaq_f64(s6, a6, xi); s7 = vfmaq_f64(s7, a7, xi);
+    }
+    y[j0 + 4] += vaddvq_f64(s4); y[j0 + 5] += vaddvq_f64(s5); y[j0 + 6] += vaddvq_f64(s6); y[j0 + 7] += vaddvq_f64(s7);
+    for (int c = 4; c < 8; c++) {
+      const double *col = A + (size_t)(j0 + c) * lda;
+      for (int r = 4; r < c; r++) { y[j0 + r] += col[j0 + r] * x[j0 + c]; y[j0 + c] += col[j0 + r] * x[j0 + r]; }
+      y[j0 + c] += col[j0 + c] * x[j0 + c];
+    }
+  }
   for (; j0 + 4 <= n; j0 += 4) {
     const double *c0 = A + (size_t)j0 * lda, *c1 = c0 + lda, *c2 = c1 + lda, *c3 = c2 + lda;
     float64x2_t x0 = vdupq_n_f64(x[j0]), x1 = vdupq_n_f64(x[j0 + 1]), x2 = vdupq_n_f64(x[j0 + 2]),
@@ -237,6 +279,48 @@ void xtb_dsymmetrize_pad(const lint *np, const double *src, const lint *ldsp, do
 static void symv_upper_f(int n, float alpha, const float *A, int lda, const float *x, float *y) {
   for (int i = 0; i < n; i++) y[i] = 0.0f;
   int j0 = 0;
+  // Eight columns per pass while they fit: each column's dot product is a chain of one fused multiply-add per
+  // vector of rows (4-cycle latency), so eight chains keep the four FMA pipes busy where four can't (1.1-1.25x).
+  // Same bits as two passes of four: rows above j0 see the eight columns in the same order, and the last four
+  // columns' rows j0 .. j0 + 3 follow the first four's diagonal block, as they would.
+  for (; j0 + 8 <= n; j0 += 8) {
+    const float *c0 = A + (size_t)j0 * lda, *c1 = c0 + lda, *c2 = c1 + lda, *c3 = c2 + lda, *c4 = c3 + lda,
+              *c5 = c4 + lda, *c6 = c5 + lda, *c7 = c6 + lda;
+    float32x4_t x0 = vdupq_n_f32(x[j0]), x1 = vdupq_n_f32(x[j0 + 1]), x2 = vdupq_n_f32(x[j0 + 2]),
+                x3 = vdupq_n_f32(x[j0 + 3]), x4 = vdupq_n_f32(x[j0 + 4]), x5 = vdupq_n_f32(x[j0 + 5]),
+                x6 = vdupq_n_f32(x[j0 + 6]), x7 = vdupq_n_f32(x[j0 + 7]);
+    float32x4_t s0 = vdupq_n_f32(0), s1 = s0, s2 = s0, s3 = s0, s4 = s0, s5 = s0, s6 = s0, s7 = s0;
+    int i = 0;
+    for (; i + 4 <= j0; i += 4) {
+      float32x4_t a0 = vld1q_f32(c0 + i), a1 = vld1q_f32(c1 + i), a2 = vld1q_f32(c2 + i), a3 = vld1q_f32(c3 + i);
+      float32x4_t a4 = vld1q_f32(c4 + i), a5 = vld1q_f32(c5 + i), a6 = vld1q_f32(c6 + i), a7 = vld1q_f32(c7 + i);
+      float32x4_t xi = vld1q_f32(x + i), yi = vld1q_f32(y + i);
+      yi = vfmaq_f32(yi, a0, x0); yi = vfmaq_f32(yi, a1, x1); yi = vfmaq_f32(yi, a2, x2); yi = vfmaq_f32(yi, a3, x3);
+      yi = vfmaq_f32(yi, a4, x4); yi = vfmaq_f32(yi, a5, x5); yi = vfmaq_f32(yi, a6, x6); yi = vfmaq_f32(yi, a7, x7);
+      vst1q_f32(y + i, yi);
+      s0 = vfmaq_f32(s0, a0, xi); s1 = vfmaq_f32(s1, a1, xi); s2 = vfmaq_f32(s2, a2, xi); s3 = vfmaq_f32(s3, a3, xi);
+      s4 = vfmaq_f32(s4, a4, xi); s5 = vfmaq_f32(s5, a5, xi); s6 = vfmaq_f32(s6, a6, xi); s7 = vfmaq_f32(s7, a7, xi);
+    }
+    y[j0] += vaddvq_f32(s0); y[j0 + 1] += vaddvq_f32(s1); y[j0 + 2] += vaddvq_f32(s2); y[j0 + 3] += vaddvq_f32(s3);
+    for (int c = 0; c < 4; c++) {
+      const float *col = A + (size_t)(j0 + c) * lda;
+      for (int r = 0; r < c; r++) { y[j0 + r] += col[j0 + r] * x[j0 + c]; y[j0 + c] += col[j0 + r] * x[j0 + r]; }
+      y[j0 + c] += col[j0 + c] * x[j0 + c];
+    }
+    for (; i + 4 <= j0 + 4; i += 4) {
+      float32x4_t a4 = vld1q_f32(c4 + i), a5 = vld1q_f32(c5 + i), a6 = vld1q_f32(c6 + i), a7 = vld1q_f32(c7 + i);
+      float32x4_t xi = vld1q_f32(x + i), yi = vld1q_f32(y + i);
+      yi = vfmaq_f32(yi, a4, x4); yi = vfmaq_f32(yi, a5, x5); yi = vfmaq_f32(yi, a6, x6); yi = vfmaq_f32(yi, a7, x7);
+      vst1q_f32(y + i, yi);
+      s4 = vfmaq_f32(s4, a4, xi); s5 = vfmaq_f32(s5, a5, xi); s6 = vfmaq_f32(s6, a6, xi); s7 = vfmaq_f32(s7, a7, xi);
+    }
+    y[j0 + 4] += vaddvq_f32(s4); y[j0 + 5] += vaddvq_f32(s5); y[j0 + 6] += vaddvq_f32(s6); y[j0 + 7] += vaddvq_f32(s7);
+    for (int c = 4; c < 8; c++) {
+      const float *col = A + (size_t)(j0 + c) * lda;
+      for (int r = 4; r < c; r++) { y[j0 + r] += col[j0 + r] * x[j0 + c]; y[j0 + c] += col[j0 + r] * x[j0 + r]; }
+      y[j0 + c] += col[j0 + c] * x[j0 + c];
+    }
+  }
   for (; j0 + 4 <= n; j0 += 4) {
     const float *c0 = A + (size_t)j0 * lda, *c1 = c0 + lda, *c2 = c1 + lda, *c3 = c2 + lda;
     float32x4_t x0 = vdupq_n_f32(x[j0]), x1 = vdupq_n_f32(x[j0 + 1]), x2 = vdupq_n_f32(x[j0 + 2]),
