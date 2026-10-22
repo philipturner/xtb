@@ -66,6 +66,8 @@ extern void dgemm_(const char *, const char *, const lint *, const lint *, const
                    const double *, const lint *, const double *, const lint *, const double *, double *, const lint *);
 extern void dger_(const lint *, const lint *, const double *, const double *, const lint *, const double *,
                   const lint *, double *, const lint *);
+extern void sgemm_(const char *, const char *, const lint *, const lint *, const lint *, const float *,
+                   const float *, const lint *, const float *, const lint *, const float *, float *, const lint *);
 extern void sgemv_(const char *, const lint *, const lint *, const float *, const float *, const lint *,
                    const float *, const lint *, const float *, float *, const lint *);
 extern void ssymv_(const char *, const lint *, const float *, const float *, const lint *, const float *,
@@ -80,9 +82,9 @@ extern void sscal_(const lint *, const float *, float *, const lint *);
 
 #if defined(__aarch64__)
 // y = alpha * A x, A symmetric, upper triangle, n x n, column-major with lda
-static void symv_upper(int n, double alpha, const double *A, int lda, const double *x, double *y) {
-  for (int i = 0; i < n; i++) y[i] = 0.0;
-  int j0 = 0;
+// y(0 .. n - 1) += the contributions of columns jbeg .. n - 1 of the upper triangle (jbeg a multiple of 8)
+static void symv_cols(int jbeg, int n, const double *A, int lda, const double *x, double *y) {
+  int j0 = jbeg;
   // Eight columns per pass while they fit: each column's dot product is a chain of one fused multiply-add per
   // vector of rows (4-cycle latency), so eight chains keep the four FMA pipes busy where four can't (1.1-1.25x).
   // Same bits as two passes of four: rows above j0 see the eight columns in the same order, and the last four
@@ -156,6 +158,11 @@ static void symv_upper(int n, double alpha, const double *A, int lda, const doub
     for (int i = 0; i < j0; i++) { y[i] += col[i] * x[j0]; s += col[i] * x[i]; }
     y[j0] += s + col[j0] * x[j0];
   }
+}
+
+static void symv_upper(int n, double alpha, const double *A, int lda, const double *x, double *y) {
+  for (int i = 0; i < n; i++) y[i] = 0;
+  symv_cols(0, n, A, lda, x, y);
   if (alpha != 1.0) for (int i = 0; i < n; i++) y[i] *= alpha;
 }
 #endif
@@ -354,10 +361,6 @@ static void sytrd_u(int sym, lint n, double *a, lint lda, double *d, double *e, 
 }
 
 
-/* Fortran: call xtb_dsytrd_upper(n, a, lda, d, e, tau, work), work of size n * 32 */
-void xtb_dsytrd_upper(const lint *n, double *a, const lint *lda, double *d, double *e, double *tau, double *work) {
-  sytrd_u(1, *n, a, *lda, d, e, tau, work);
-}
 
 /* Fortran: call xtb_dsytrd_full(n, a, lda, d, e, tau, work): a holds the full symmetric
  * matrix; on return its upper triangle holds what xtb_dsytrd_upper leaves there (the lower
@@ -390,9 +393,9 @@ void xtb_dsymmetrize_pad(const lint *np, const double *src, const lint *ldsp, do
  * are computed here because the legacy Fortran ABI of sdot_ (Accelerate) returns a
  * double. */
 #if defined(__aarch64__)
-static void symv_upper_f(int n, float alpha, const float *A, int lda, const float *x, float *y) {
-  for (int i = 0; i < n; i++) y[i] = 0.0f;
-  int j0 = 0;
+// y(0 .. n - 1) += the contributions of columns jbeg .. n - 1 of the upper triangle (jbeg a multiple of 8)
+static void symv_cols_f(int jbeg, int n, const float *A, int lda, const float *x, float *y) {
+  int j0 = jbeg;
   // Eight columns per pass while they fit: each column's dot product is a chain of one fused multiply-add per
   // vector of rows (4-cycle latency), so eight chains keep the four FMA pipes busy where four can't (1.1-1.25x).
   // Same bits as two passes of four: rows above j0 see the eight columns in the same order, and the last four
@@ -466,6 +469,11 @@ static void symv_upper_f(int n, float alpha, const float *A, int lda, const floa
     for (int i = 0; i < j0; i++) { y[i] += col[i] * x[j0]; s += col[i] * x[i]; }
     y[j0] += s + col[j0] * x[j0];
   }
+}
+
+static void symv_upper_f(int n, float alpha, const float *A, int lda, const float *x, float *y) {
+  for (int i = 0; i < n; i++) y[i] = 0;
+  symv_cols_f(0, n, A, lda, x, y);
   if (alpha != 1.0f) for (int i = 0; i < n; i++) y[i] *= alpha;
 }
 #endif
@@ -567,10 +575,197 @@ static void sytrd_u_f(lint n, float *a, lint lda, float *d, float *e, float *tau
   sytd2_u_f(kk, a, lda, d, e, tau);
 }
 
+/* The reduction on the caller's OpenMP threads: one team for the whole call (a parallel region
+ * per column costs more than the column), synchronized by a spinning barrier (about 0.1 us
+ * with 4 threads). Per column of dlatrd: rows of the panel update split across threads ->
+ * barrier -> xlarfg on thread 0 -> barrier -> symv split by columns (equal triangle areas)
+ * into per-thread vectors, and panel_dots split by rows -> barrier -> sum of the vectors,
+ * panel_update, scaling and the partial dot, split by rows -> barrier -> axpy, same rows (and
+ * the next column's panel update, same rows again). The syr2k after each panel is split by
+ * columns (gemm above the diagonal blocks); the leading columns below order 128 run serially
+ * on thread 0. Same result up to rounding, and the same bits for the same thread count; one
+ * thread takes the serial path. */
+#if defined(_OPENMP) && defined(__aarch64__)
+#include <stdatomic.h>
+
+typedef struct {
+  _Alignas(128) atomic_int count;
+  _Alignas(128) atomic_int generation;
+} xtb_barrier;
+
+static void xtb_barrier_wait(xtb_barrier *b, int threads) {
+  int g = atomic_load_explicit(&b->generation, memory_order_acquire);
+  if (atomic_fetch_add_explicit(&b->count, 1, memory_order_acq_rel) == threads - 1) {
+    atomic_store_explicit(&b->count, 0, memory_order_relaxed);
+    atomic_store_explicit(&b->generation, g + 1, memory_order_release);
+  } else {
+    while (atomic_load_explicit(&b->generation, memory_order_acquire) == g) __asm__ volatile("yield");
+  }
+}
+
+// Start of part t of [0, len) in T parts, at multiples of 32 elements (whole cache lines)
+static lint team_rows(lint len, int t, int threads) {
+  lint r = ((len * t / threads + 31) / 32) * 32;
+  return r < len ? r : len;
+}
+
+// Start of the columns of thread t of the upper triangle of order len: equal areas, multiples of 8
+static lint team_cols(lint len, int t, int threads) {
+  if (t == threads) return len;
+  lint c = (lint)(len * sqrt((double)t / threads) / 8 + 0.5) * 8;
+  return c < len ? c : len;
+}
+
+#define SYTRD_TEAM(SFX, T, FMA, LARFG, SYR2K, GEMM, SYMV_COLS, PANEL_UPDATE, PANEL_DOTS, REST)    \
+static void latrd_team##SFX(int t, int threads, lint n, lint nb, T *a, lint lda, T *e, T *tau,    \
+                            T *w, lint ldw, T *ybuf, lint ldy, T *ubuf, T *dbuf, T *shared,       \
+                            xtb_barrier *bar) {                                                   \
+  const lint i1 = 1;                                                                              \
+  T wlast_alpha = 0;  /* the last column's W(i, iw + 1), recomputed by every thread */            \
+  for (lint i = n; i >= n - nb + 1; i--) {                                                        \
+    lint iw = i - n + nb;                                                                         \
+    if (i < n) {                                                                                  \
+      lint m = n - i, r0 = team_rows(i, t, threads), r1 = team_rows(i, t + 1, threads);           \
+      T wr[32], ar[32];                                                                           \
+      wr[0] = wlast_alpha; ar[0] = a[(i - 1) + (size_t)i * lda];                                  \
+      for (lint c = 1; c < m; c++) {                                                              \
+        wr[c] = w[(i - 1) + (size_t)(iw + c) * ldw]; ar[c] = a[(i - 1) + (size_t)(i + c) * lda];  \
+      }                                                                                           \
+      if (r1 > r0)                                                                                \
+        PANEL_UPDATE(r1 - r0, m, a + r0 + (size_t)i * lda, lda, wr, w + r0 + (size_t)iw * ldw,    \
+                     ldw, ar, a + r0 + (size_t)(i - 1) * lda);                                    \
+    }                                                                                             \
+    if (i == 1) break;                                                                            \
+    lint im1 = i - 1, m = n - i;                                                                  \
+    T *v = a + (size_t)(i - 1) * lda, *wc = w + (size_t)(iw - 1) * ldw;                           \
+    xtb_barrier_wait(bar, threads);                                                               \
+    if (t == 0) {                                                                                 \
+      LARFG(&im1, &v[i - 2], v, &i1, &tau[i - 2]);                                                \
+      e[i - 2] = v[i - 2];                                                                        \
+      v[i - 2] = 1;                                                                               \
+    }                                                                                             \
+    xtb_barrier_wait(bar, threads);                                                               \
+    /* symv: columns c0 .. c1 - 1 into ybuf_t(0 .. c1 - 1) */                                     \
+    lint cend[65];                                                                                \
+    for (int q = 0; q <= threads; q++) cend[q] = team_cols(im1, q, threads);                      \
+    lint c0 = cend[t], c1 = cend[t + 1];                                                          \
+    T *y = ybuf + (size_t)t * ldy;                                                                \
+    for (lint r = 0; r < c1; r++) y[r] = 0;                                                       \
+    if (c1 > c0) SYMV_COLS(c0, c1, a, lda, v, y);                                                 \
+    lint r0 = team_rows(im1, t, threads), r1 = team_rows(im1, t + 1, threads);                    \
+    T *u = ubuf + (size_t)t * 64;                                                                 \
+    for (lint c = 0; c < m; c++) { u[c] = 0; u[32 + c] = 0; }                                     \
+    if (m > 0 && r1 > r0)                                                                         \
+      PANEL_DOTS(r1 - r0, m, w + r0 + (size_t)iw * ldw, ldw, a + r0 + (size_t)i * lda, lda,       \
+                 v + r0, u, u + 32);                                                              \
+    xtb_barrier_wait(bar, threads);                                                               \
+    T us[64];                                                                                     \
+    for (lint c = 0; c < m; c++) {                                                                \
+      T s1 = 0, s2 = 0;                                                                           \
+      for (int s = 0; s < threads; s++) {                                                         \
+        s1 += ubuf[(size_t)s * 64 + c]; s2 += ubuf[(size_t)s * 64 + 32 + c];                      \
+      }                                                                                           \
+      us[c] = s1; us[32 + c] = s2;                                                                \
+    }                                                                                             \
+    if (t == 0) for (lint c = 0; c < m; c++) w[i + c + (size_t)(iw - 1) * ldw] = us[32 + c];      \
+    for (lint r = r0; r < r1; r++) {                                                              \
+      T s = 0;                                                                                    \
+      for (int q = 0; q < threads; q++) if (r < cend[q + 1]) s += ybuf[(size_t)q * ldy + r];      \
+      wc[r] = s;                                                                                  \
+    }                                                                                             \
+    if (m > 0 && r1 > r0)                                                                         \
+      PANEL_UPDATE(r1 - r0, m, a + r0 + (size_t)i * lda, lda, us, w + r0 + (size_t)iw * ldw, ldw, \
+                   us + 32, wc + r0);                                                             \
+    T taui = tau[i - 2], dot = 0;                                                                 \
+    for (lint r = r0; r < r1; r++) { wc[r] *= taui; dot += wc[r] * v[r]; }                        \
+    dbuf[(size_t)t * 32] = dot;                                                                   \
+    if (r0 < im1 && im1 <= r1) shared[0] = wc[im1 - 1];                                           \
+    xtb_barrier_wait(bar, threads);                                                               \
+    T sum = 0;                                                                                    \
+    for (int s = 0; s < threads; s++) sum += dbuf[(size_t)s * 32];                                \
+    T alpha = -(T)0.5 * taui * sum;                                                               \
+    for (lint r = r0; r < r1; r++) wc[r] = FMA(alpha, v[r], wc[r]);                               \
+    wlast_alpha = FMA(alpha, v[im1 - 1], shared[0]);                                              \
+  }                                                                                               \
+}                                                                                                 \
+static void sytrd_team##SFX(lint n, T *a, lint lda, T *d, T *e, T *tau, T *work, int threads) {   \
+  const lint nb = 32, nx = 32, tail = 128; const T mone = -1, one = 1;                            \
+  lint kk = n - ((n - nx + nb - 1) / nb) * nb, ldy = (n + 31) / 32 * 32;                          \
+  T *ybuf = malloc(sizeof(T) * ((size_t)threads * (ldy + 64 + 32) + 32));                         \
+  T *ubuf = ybuf + (size_t)threads * ldy, *dbuf = ubuf + (size_t)threads * 64,                    \
+    *shared = dbuf + (size_t)threads * 32;                                                        \
+  xtb_barrier bar; atomic_init(&bar.count, 0); atomic_init(&bar.generation, 0);                   \
+  lint last = n - nb + 1;  /* first column of the last panel the team reduces */                  \
+  while (last - nb >= kk + 1 && last - 1 >= tail) last -= nb;                                     \
+  XTB_OMP_PRAGMA(omp parallel num_threads(threads))                                               \
+  {                                                                                               \
+    int t = omp_get_thread_num(), team = omp_get_num_threads();                                   \
+    for (lint i = n - nb + 1; i >= last; i -= nb) {                                               \
+      lint m = i + nb - 1, im1 = i - 1;                                                           \
+      latrd_team##SFX(t, team, m, nb, a, lda, e, tau, work, n, ybuf, ldy, ubuf, dbuf, shared,     \
+                      &bar);                                                                      \
+      xtb_barrier_wait(&bar, team);                                                               \
+      {  /* columns c0 .. c1 - 1 of the update, equal areas */                                    \
+        lint c0 = team_cols(im1, t, team), c1 = team_cols(im1, t + 1, team), nc = c1 - c0;        \
+        const T *v = &a[(size_t)(i - 1) * lda];                                                   \
+        if (c0 > 0 && nc > 0) {                                                                   \
+          T *ac = &a[(size_t)c0 * lda];                                                           \
+          GEMM("N", "T", &c0, &nc, &nb, &mone, v, &lda, work + c0, &n, &one, ac, &lda);           \
+          GEMM("N", "T", &c0, &nc, &nb, &mone, work, &n, v + c0, &lda, &one, ac, &lda);           \
+        }                                                                                         \
+        if (nc > 0)                                                                               \
+          SYR2K("U", "N", &nc, &nb, &mone, v + c0, &lda, work + c0, &n, &one,                     \
+                &a[c0 + (size_t)c0 * lda], &lda);                                                 \
+      }                                                                                           \
+      xtb_barrier_wait(&bar, team);                                                               \
+      if (t == 0) {                                                                               \
+        for (lint j = i; j <= i + nb - 1; j++) {                                                  \
+          a[(j - 2) + (size_t)(j - 1) * lda] = e[j - 2];                                          \
+          d[j - 1] = a[(j - 1) + (size_t)(j - 1) * lda];                                          \
+        }                                                                                         \
+      }                                                                                           \
+      xtb_barrier_wait(&bar, team);                                                               \
+    }                                                                                             \
+  }                                                                                               \
+  free(ybuf);                                                                                     \
+  /* the leading last - 1 columns, serially */                                                    \
+  REST(last - 1, a, lda, d, e, tau, work);                                                        \
+}
+static void sytrd_rest_d(lint n, double *a, lint lda, double *d, double *e, double *tau, double *work) {
+  sytrd_u(1, n, a, lda, d, e, tau, work);
+}
+SYTRD_TEAM(_d, double, fma, dlarfg_, dsyr2k_, dgemm_, symv_cols, panel_update_d, panel_dots_d, sytrd_rest_d)
+SYTRD_TEAM(_f, float, fmaf, slarfg_, ssyr2k_, sgemm_, symv_cols_f, panel_update_f, panel_dots_f, sytrd_u_f)
+#endif
+
+/* The reduction on the caller's OpenMP threads from this order up, on at most 4 of them (one
+ * cluster of performance cores on the M1 Max: 6 and 8 threads were slower than 4) */
+enum { xtb_sytrd_team_min = 256, xtb_sytrd_team_max = 4 };
+
+/* Fortran: call xtb_dsytrd_upper(n, a, lda, d, e, tau, work), work of size n * 32 */
+void xtb_dsytrd_upper(const lint *n, double *a, const lint *lda, double *d, double *e, double *tau, double *work) {
+#if defined(_OPENMP) && defined(__aarch64__)
+  int threads = xtb_omp_threads();
+  if (threads > 1 && *n >= xtb_sytrd_team_min) {
+    sytrd_team_d(*n, a, *lda, d, e, tau, work, threads > xtb_sytrd_team_max ? xtb_sytrd_team_max : threads);
+    return;
+  }
+#endif
+  sytrd_u(1, *n, a, *lda, d, e, tau, work);
+}
+
 /* Fortran: call xtb_ssytrd_upper(n, a, lda, d, e, tau, work), work of size n * 32 */
 void xtb_ssytrd_upper(const lint *n, float *a, const lint *lda, float *d, float *e, float *tau, float *work) {
+#if defined(_OPENMP) && defined(__aarch64__)
+  int threads = xtb_omp_threads();
+  if (threads > 1 && *n >= xtb_sytrd_team_min) {
+    sytrd_team_f(*n, a, *lda, d, e, tau, work, threads > xtb_sytrd_team_max ? xtb_sytrd_team_max : threads);
+    return;
+  }
+#endif
   sytrd_u_f(*n, a, *lda, d, e, tau, work);
 }
+
 
 /* Back-transformation Z = Q Z with Q from xtb_dsytrd_upper / xtb_ssytrd_upper: what
  * xormtr('L', 'U', 'N', n, m, a, lda, tau, z, ldz) computes, in xormql's blocks of nb = 32
