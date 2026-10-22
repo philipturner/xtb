@@ -87,7 +87,7 @@ subroutine gfnff_setup(env,verbose,restart,mol,gen,param,topo,neigh,accuracy,efi
      return
   end if
 
-  if (.not.mol%info%two_dimensional) then
+  if (restart .and. .not.mol%info%two_dimensional) then
      call write_restart_gff(env,'gfnff_topo',mol%n,version,topo,neigh)
   end if
 
@@ -222,7 +222,7 @@ subroutine gfnff_input(env, mol, topo, neigh, print_setup)
   ! General case: input = xyz or coord
   case default
     ini = .true.
-    call open_file(ich,'.CHRG','r')
+    ich = -1 ! swift-xtb: never read a '.CHRG' file from the working directory
     if (ich.ne.-1) then
       read(ich,'(a)') atmp_0 ! first line contains total charge
       read(ich,'(a)',iostat=err)atmp  ! second line contains fragment charges
