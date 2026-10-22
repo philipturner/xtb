@@ -17,10 +17,12 @@
 /* Reduction of a symmetric matrix (upper triangle) to tridiagonal form: LAPACK's
  * blocked dsytrd (dlatrd panels of 32 columns + dsyr2k, dsytd2 for the last block),
  * ported unchanged, so the output (Householder vectors in A, tau) is what dormtr
- * expects. The only change: on aarch64 the symmetric matrix-vector product, the
- * BLAS2 core of the reduction, is a hand-vectorized kernel that reads the triangle
- * once for eight columns at a time (~55-65 GB/s on M1 Max against ~30 GB/s for
- * Accelerate's dsymv; dsytrd 30% faster at n = 412-776). Elsewhere it calls dsymv.
+ * expects. The changes, on aarch64: the symmetric matrix-vector product, the BLAS2
+ * core of the reduction, is a hand-vectorized kernel that reads the triangle once for
+ * eight columns at a time (~55-65 GB/s on M1 Max against ~30 GB/s for Accelerate's
+ * dsymv; dsytrd 30% faster at n = 412-776), and dlatrd's six panel gemv calls per
+ * column are three fused passes (panel_update, panel_dots). Elsewhere it calls dsymv
+ * and dgemv.
  *
  * xtb_dsytrd_full is the same reduction on the full matrix (both triangles stored and
  * updated): dgemv 'T' (A^T x = A x) instead of the symmetric product, two dgemm instead of
@@ -145,6 +147,88 @@ static void symv_upper(int n, double alpha, const double *A, int lda, const doub
 }
 #endif
 
+#if defined(__aarch64__)
+/* dlatrd's panel products, fused (each pair of LAPACK's gemv calls reads the panels of A and W
+ * that share their rows): panel_update y -= P1 c1 + P2 c2 in one pass over y, eight columns
+ * per load of y; panel_dots u1 = P1^T x, u2 = P2^T x in one pass over x, eight dot products
+ * per load of x. P1 and P2 are rows x m, column-major; c1, c2, u1, u2 contiguous. */
+#define PANEL_KERNELS(T, V, W, S, SFX)                                                            \
+static void panel_update##SFX(lint rows, lint m, const T *p1, lint ld1, const T *c1, const T *p2,  \
+                              lint ld2, const T *c2, T *y) {                                     \
+  lint c = 0;                                                                                     \
+  for (; c + 4 <= m; c += 4) {                                                                    \
+    const T *a0 = p1 + (size_t)c * ld1, *a1 = a0 + ld1, *a2 = a1 + ld1, *a3 = a2 + ld1;           \
+    const T *b0 = p2 + (size_t)c * ld2, *b1 = b0 + ld2, *b2 = b1 + ld2, *b3 = b2 + ld2;           \
+    V ka0 = vdupq_n_##S(c1[c]), ka1 = vdupq_n_##S(c1[c + 1]), ka2 = vdupq_n_##S(c1[c + 2]),        \
+      ka3 = vdupq_n_##S(c1[c + 3]), kb0 = vdupq_n_##S(c2[c]), kb1 = vdupq_n_##S(c2[c + 1]),        \
+      kb2 = vdupq_n_##S(c2[c + 2]), kb3 = vdupq_n_##S(c2[c + 3]);                                 \
+    lint i = 0;                                                                                   \
+    for (; i + W <= rows; i += W) {                                                               \
+      V yi = vld1q_##S(y + i);                                                                    \
+      yi = vfmsq_##S(yi, vld1q_##S(a0 + i), ka0); yi = vfmsq_##S(yi, vld1q_##S(b0 + i), kb0);     \
+      yi = vfmsq_##S(yi, vld1q_##S(a1 + i), ka1); yi = vfmsq_##S(yi, vld1q_##S(b1 + i), kb1);     \
+      yi = vfmsq_##S(yi, vld1q_##S(a2 + i), ka2); yi = vfmsq_##S(yi, vld1q_##S(b2 + i), kb2);     \
+      yi = vfmsq_##S(yi, vld1q_##S(a3 + i), ka3); yi = vfmsq_##S(yi, vld1q_##S(b3 + i), kb3);     \
+      vst1q_##S(y + i, yi);                                                                       \
+    }                                                                                             \
+    for (; i < rows; i++)                                                                         \
+      y[i] -= a0[i] * c1[c] + b0[i] * c2[c] + a1[i] * c1[c + 1] + b1[i] * c2[c + 1]               \
+            + a2[i] * c1[c + 2] + b2[i] * c2[c + 2] + a3[i] * c1[c + 3] + b3[i] * c2[c + 3];      \
+  }                                                                                               \
+  for (; c < m; c++) {                                                                            \
+    const T *a0 = p1 + (size_t)c * ld1, *b0 = p2 + (size_t)c * ld2;                               \
+    V ka = vdupq_n_##S(c1[c]), kb = vdupq_n_##S(c2[c]);                                           \
+    lint i = 0;                                                                                   \
+    for (; i + W <= rows; i += W) {                                                               \
+      V yi = vld1q_##S(y + i);                                                                    \
+      yi = vfmsq_##S(yi, vld1q_##S(a0 + i), ka); yi = vfmsq_##S(yi, vld1q_##S(b0 + i), kb);       \
+      vst1q_##S(y + i, yi);                                                                       \
+    }                                                                                             \
+    for (; i < rows; i++) y[i] -= a0[i] * c1[c] + b0[i] * c2[c];                                  \
+  }                                                                                               \
+}                                                                                                 \
+static void panel_dots##SFX(lint rows, lint m, const T *p1, lint ld1, const T *p2, lint ld2,       \
+                            const T *x, T *u1, T *u2) {                                           \
+  lint c = 0;                                                                                     \
+  for (; c + 4 <= m; c += 4) {                                                                    \
+    const T *a0 = p1 + (size_t)c * ld1, *a1 = a0 + ld1, *a2 = a1 + ld1, *a3 = a2 + ld1;           \
+    const T *b0 = p2 + (size_t)c * ld2, *b1 = b0 + ld2, *b2 = b1 + ld2, *b3 = b2 + ld2;           \
+    V sa0 = vdupq_n_##S(0), sa1 = sa0, sa2 = sa0, sa3 = sa0, sb0 = sa0, sb1 = sa0, sb2 = sa0,       \
+      sb3 = sa0;                                                                                  \
+    lint i = 0;                                                                                   \
+    for (; i + W <= rows; i += W) {                                                               \
+      V xi = vld1q_##S(x + i);                                                                    \
+      sa0 = vfmaq_##S(sa0, vld1q_##S(a0 + i), xi); sb0 = vfmaq_##S(sb0, vld1q_##S(b0 + i), xi);   \
+      sa1 = vfmaq_##S(sa1, vld1q_##S(a1 + i), xi); sb1 = vfmaq_##S(sb1, vld1q_##S(b1 + i), xi);   \
+      sa2 = vfmaq_##S(sa2, vld1q_##S(a2 + i), xi); sb2 = vfmaq_##S(sb2, vld1q_##S(b2 + i), xi);   \
+      sa3 = vfmaq_##S(sa3, vld1q_##S(a3 + i), xi); sb3 = vfmaq_##S(sb3, vld1q_##S(b3 + i), xi);   \
+    }                                                                                             \
+    T ta0 = vaddvq_##S(sa0), ta1 = vaddvq_##S(sa1), ta2 = vaddvq_##S(sa2), ta3 = vaddvq_##S(sa3);  \
+    T tb0 = vaddvq_##S(sb0), tb1 = vaddvq_##S(sb1), tb2 = vaddvq_##S(sb2), tb3 = vaddvq_##S(sb3);  \
+    for (; i < rows; i++) {                                                                       \
+      ta0 += a0[i] * x[i]; ta1 += a1[i] * x[i]; ta2 += a2[i] * x[i]; ta3 += a3[i] * x[i];         \
+      tb0 += b0[i] * x[i]; tb1 += b1[i] * x[i]; tb2 += b2[i] * x[i]; tb3 += b3[i] * x[i];         \
+    }                                                                                             \
+    u1[c] = ta0; u1[c + 1] = ta1; u1[c + 2] = ta2; u1[c + 3] = ta3;                               \
+    u2[c] = tb0; u2[c + 1] = tb1; u2[c + 2] = tb2; u2[c + 3] = tb3;                               \
+  }                                                                                               \
+  for (; c < m; c++) {                                                                            \
+    const T *a0 = p1 + (size_t)c * ld1, *b0 = p2 + (size_t)c * ld2;                               \
+    V sa = vdupq_n_##S(0), sb = sa;                                                               \
+    lint i = 0;                                                                                   \
+    for (; i + W <= rows; i += W) {                                                               \
+      V xi = vld1q_##S(x + i);                                                                    \
+      sa = vfmaq_##S(sa, vld1q_##S(a0 + i), xi); sb = vfmaq_##S(sb, vld1q_##S(b0 + i), xi);       \
+    }                                                                                             \
+    T ta = vaddvq_##S(sa), tb = vaddvq_##S(sb);                                                   \
+    for (; i < rows; i++) { ta += a0[i] * x[i]; tb += b0[i] * x[i]; }                             \
+    u1[c] = ta; u2[c] = tb;                                                                       \
+  }                                                                                               \
+}
+PANEL_KERNELS(double, float64x2_t, 2, f64, _d)
+PANEL_KERNELS(float, float32x4_t, 4, f32, _f)
+#endif
+
 static void symv(lint n, double alpha, const double *A, lint lda, const double *x, double *y) {
 #if defined(__aarch64__)
   symv_upper(n, alpha, A, lda, x, y);
@@ -167,12 +251,21 @@ static void matvec(int sym, lint n, double alpha, const double *A, lint lda, con
 // LAPACK dlatrd, UPLO = 'U'
 static void latrd_u(int sym, lint n, lint nb, double *a, lint lda, double *e, double *tau, double *w, lint ldw) {
   const double one = 1, mone = -1, zero = 0, half = 0.5; const lint i1 = 1;
+#if defined(__aarch64__)
+  (void)mone; (void)zero;  // the fused panel kernels replace the gemv calls
+#endif
   for (lint i = n; i >= n - nb + 1; i--) {
     lint iw = i - n + nb;
     if (i < n) {
       lint m = n - i;
+#if defined(__aarch64__)
+      double wr[32], ar[32];
+      for (lint c = 0; c < m; c++) { wr[c] = W_(i, iw + 1 + c); ar[c] = A_(i, i + 1 + c); }
+      panel_update_d(i, m, &A_(1, i + 1), lda, wr, &W_(1, iw + 1), ldw, ar, &A_(1, i));
+#else
       dgemv_("N", &i, &m, &mone, &A_(1, i + 1), &lda, &W_(i, iw + 1), &ldw, &one, &A_(1, i), &i1);
       dgemv_("N", &i, &m, &mone, &W_(1, iw + 1), &ldw, &A_(i, i + 1), &lda, &one, &A_(1, i), &i1);
+#endif
     }
     if (i > 1) {
       lint im1 = i - 1;
@@ -182,10 +275,18 @@ static void latrd_u(int sym, lint n, lint nb, double *a, lint lda, double *e, do
       matvec(sym, im1, one, a, lda, &A_(1, i), &W_(1, iw));
       if (i < n) {
         lint m = n - i;
+#if defined(__aarch64__)
+        // u = W^T v and u2 = A^T v in one pass, then w -= A u + W u2 in one; W(i + 1 .. n, iw) ends as
+        // u2, as with LAPACK's call order.
+        double u[32];
+        panel_dots_d(im1, m, &W_(1, iw + 1), ldw, &A_(1, i + 1), lda, &A_(1, i), u, &W_(i + 1, iw));
+        panel_update_d(im1, m, &A_(1, i + 1), lda, u, &W_(1, iw + 1), ldw, &W_(i + 1, iw), &W_(1, iw));
+#else
         dgemv_("T", &im1, &m, &one, &W_(1, iw + 1), &ldw, &A_(1, i), &i1, &zero, &W_(i + 1, iw), &i1);
         dgemv_("N", &im1, &m, &mone, &A_(1, i + 1), &lda, &W_(i + 1, iw), &i1, &one, &W_(1, iw), &i1);
         dgemv_("T", &im1, &m, &one, &A_(1, i + 1), &lda, &A_(1, i), &i1, &zero, &W_(i + 1, iw), &i1);
         dgemv_("N", &im1, &m, &mone, &W_(1, iw + 1), &ldw, &W_(i + 1, iw), &i1, &one, &W_(1, iw), &i1);
+#endif
       }
       dscal_(&im1, &tau[i - 2], &W_(1, iw), &i1);
       double alpha = -half * tau[i - 2] * ddot_(&im1, &W_(1, iw), &i1, &A_(1, i), &i1);
@@ -376,12 +477,21 @@ static float dot_f(lint n, const float *x, const float *y) {
 
 static void latrd_u_f(lint n, lint nb, float *a, lint lda, float *e, float *tau, float *w, lint ldw) {
   const float one = 1, mone = -1, zero = 0, half = 0.5f; const lint i1 = 1;
+#if defined(__aarch64__)
+  (void)mone; (void)zero;  // the fused panel kernels replace the gemv calls
+#endif
   for (lint i = n; i >= n - nb + 1; i--) {
     lint iw = i - n + nb;
     if (i < n) {
       lint m = n - i;
+#if defined(__aarch64__)
+      float wr[32], ar[32];
+      for (lint c = 0; c < m; c++) { wr[c] = WF_(i, iw + 1 + c); ar[c] = AF_(i, i + 1 + c); }
+      panel_update_f(i, m, &AF_(1, i + 1), lda, wr, &WF_(1, iw + 1), ldw, ar, &AF_(1, i));
+#else
       sgemv_("N", &i, &m, &mone, &AF_(1, i + 1), &lda, &WF_(i, iw + 1), &ldw, &one, &AF_(1, i), &i1);
       sgemv_("N", &i, &m, &mone, &WF_(1, iw + 1), &ldw, &AF_(i, i + 1), &lda, &one, &AF_(1, i), &i1);
+#endif
     }
     if (i > 1) {
       lint im1 = i - 1;
@@ -391,10 +501,16 @@ static void latrd_u_f(lint n, lint nb, float *a, lint lda, float *e, float *tau,
       symv_f(im1, one, a, lda, &AF_(1, i), &WF_(1, iw));
       if (i < n) {
         lint m = n - i;
+#if defined(__aarch64__)
+        float u[32];
+        panel_dots_f(im1, m, &WF_(1, iw + 1), ldw, &AF_(1, i + 1), lda, &AF_(1, i), u, &WF_(i + 1, iw));
+        panel_update_f(im1, m, &AF_(1, i + 1), lda, u, &WF_(1, iw + 1), ldw, &WF_(i + 1, iw), &WF_(1, iw));
+#else
         sgemv_("T", &im1, &m, &one, &WF_(1, iw + 1), &ldw, &AF_(1, i), &i1, &zero, &WF_(i + 1, iw), &i1);
         sgemv_("N", &im1, &m, &mone, &AF_(1, i + 1), &lda, &WF_(i + 1, iw), &i1, &one, &WF_(1, iw), &i1);
         sgemv_("T", &im1, &m, &one, &AF_(1, i + 1), &lda, &AF_(1, i), &i1, &zero, &WF_(i + 1, iw), &i1);
         sgemv_("N", &im1, &m, &mone, &WF_(1, iw + 1), &ldw, &WF_(i + 1, iw), &i1, &one, &WF_(1, iw), &i1);
+#endif
       }
       sscal_(&im1, &tau[i - 2], &WF_(1, iw), &i1);
       float alpha = -half * tau[i - 2] * dot_f(im1, &WF_(1, iw), &AF_(1, i));
