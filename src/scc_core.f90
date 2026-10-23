@@ -413,6 +413,16 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    logical  :: lastdiag
    integer  :: iter
    integer  :: thisiter
+   ! scc-lowgap (2026-10-23): optional mixer controls for small-gap / metallic clusters, all off unless set in the
+   ! environment (stock behaviour otherwise): XTB_BROYDAMP = Broyden mixing parameter (default set%broydamp, 0.40),
+   ! XTB_BROYMEM = restart the Broyden history every m iterations, XTB_KERKER = q0 (1/Bohr) of a Kerker-like
+   ! preconditioner on the shell-charge residual used for mixing (never for the convergence test), XTB_KERKER_BETA = its
+   ! strength (default 0.8).
+   real(wp) :: lg_alpha, lg_q0, lg_beta, lg_bd
+   integer  :: lg_mem, lg_ib, lg_stat, lg_i, lg_j
+   character(len=64) :: lg_val
+   real(wp), allocatable :: lg_w(:,:), lg_dqa(:), lg_s(:)
+   integer, allocatable :: lg_nsh(:)
    logical  :: converged
    logical  :: econverged
    logical  :: qconverged
@@ -448,6 +458,29 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    thisiter = maxiter - jter
 
    damp = damp0
+   lg_alpha = -1.0_wp; lg_q0 = -1.0_wp; lg_beta = 0.8_wp; lg_mem = 0
+   call get_environment_variable('XTB_BROYDAMP', lg_val, status=lg_stat)
+   if (lg_stat == 0) read(lg_val, *, iostat=lg_stat) lg_alpha
+   call get_environment_variable('XTB_BROYMEM', lg_val, status=lg_stat)
+   if (lg_stat == 0) read(lg_val, *, iostat=lg_stat) lg_mem
+   call get_environment_variable('XTB_KERKER', lg_val, status=lg_stat)
+   if (lg_stat == 0) read(lg_val, *, iostat=lg_stat) lg_q0
+   call get_environment_variable('XTB_KERKER_BETA', lg_val, status=lg_stat)
+   if (lg_stat == 0) read(lg_val, *, iostat=lg_stat) lg_beta
+   if (lg_q0 > 0.0_wp) then
+      ! row-normalized exponential weights between atoms: W dq is a local average over ~1/q0
+      allocate(lg_w(n,n), lg_dqa(n), lg_s(n), lg_nsh(n))
+      do lg_i = 1, n
+         do lg_j = 1, n
+            lg_w(lg_j,lg_i) = exp(-lg_q0*norm2(xyz(:,lg_i)-xyz(:,lg_j)))
+         end do
+         lg_w(:,lg_i) = lg_w(:,lg_i) / sum(lg_w(:,lg_i))
+      end do
+      lg_nsh = 0
+      do lg_i = 1, nshell
+         lg_nsh(ash(lg_i)) = lg_nsh(ash(lg_i)) + 1
+      end do
+   end if
    if (present(aes)) then
       nbr = nshell + 9*n
       allocate(vs(n), vd(3, n), vq(6, n))
@@ -639,6 +672,19 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    ! ------------------------------------------------------------------------
    ! end of SCC convergence part
    qconverged = rmsq < qconv
+   if (lg_q0 > 0.0_wp) then
+      ! Kerker-like: subtract beta x the local (exp(-q0 r)) average of the atomic residual, spread over the atom's
+      ! shells; damps long-wavelength charge sloshing, keeps local transfer (P = 1 - beta W is invertible for beta < 1,
+      ! so the fixed point is unchanged)
+      lg_dqa = 0.0_wp
+      do lg_i = 1, nshell
+         lg_dqa(ash(lg_i)) = lg_dqa(ash(lg_i)) + dq(lg_i)
+      end do
+      lg_s = matmul(lg_dqa, lg_w)
+      do lg_i = 1, nshell
+         dq(lg_i) = dq(lg_i) - lg_beta * lg_s(ash(lg_i)) / lg_nsh(ash(lg_i))
+      end do
+   end if
    ! ------------------------------------------------------------------------
    call scc_timer_lap(stage_population)
 
@@ -679,13 +725,17 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
 
       ! Broyden mixing
       omegap=0.0_wp
-      call broyden(nbr,q_in,qlast_in,dq,dqlast,iter,thisiter,broydamp,omega,df,u,a)
+      lg_bd = broydamp
+      if (lg_alpha > 0.0_wp) lg_bd = lg_alpha
+      lg_ib = iter
+      if (lg_mem > 0) lg_ib = mod(iter-1, lg_mem) + 1
+      call broyden(nbr,q_in,qlast_in,dq,dqlast,lg_ib,thisiter,lg_bd,omega,df,u,a)
       qsh(1:nshell)=q_in(1:nshell)
       if (present(aes)) then
          k=nshell
          call gfn2broyden_out(n,k,nbr,q_in,dipm,qp) ! CAMM case
       end if
-      if(iter.gt.1) omegap=omega(iter-1)
+      if(lg_ib.gt.1) omegap=omega(lg_ib-1)
    endif ! Broyden?
 
    call qsh2qat(ash, qsh, q) !new qat
