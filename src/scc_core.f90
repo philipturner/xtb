@@ -421,6 +421,8 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    real(wp) :: lg_alpha, lg_q0, lg_beta, lg_bd
    integer  :: lg_mem, lg_ib, lg_stat, lg_i, lg_j
    character(len=64) :: lg_val
+   ! last settings reported on stderr (printed once per process, and again whenever they change)
+   real(wp), save :: lg_said(4) = -2.0_wp
    real(wp), allocatable :: lg_w(:,:), lg_dqa(:), lg_s(:)
    integer, allocatable :: lg_nsh(:)
    logical  :: converged
@@ -467,6 +469,14 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    if (lg_stat == 0) read(lg_val, *, iostat=lg_stat) lg_q0
    call get_environment_variable('XTB_KERKER_BETA', lg_val, status=lg_stat)
    if (lg_stat == 0) read(lg_val, *, iostat=lg_stat) lg_beta
+   if (lg_alpha > 0.0_wp .or. lg_q0 > 0.0_wp .or. lg_mem > 0 .or. any(lg_said > -2.0_wp)) then
+      if (any(lg_said /= [lg_alpha, lg_q0, lg_beta, real(lg_mem, wp)])) then
+         lg_said = [lg_alpha, lg_q0, lg_beta, real(lg_mem, wp)]
+         write(0, '(a,f8.4,a,f8.4,a,f8.4,a,i0)') 'xtb scc-lowgap: XTB_BROYDAMP ', lg_alpha, &
+            & ' XTB_KERKER ', lg_q0, ' XTB_KERKER_BETA ', lg_beta, ' XTB_BROYMEM ', lg_mem
+         flush(0)
+      end if
+   end if
    if (lg_q0 > 0.0_wp) then
       ! row-normalized exponential weights between atoms: W dq is a local average over ~1/q0
       allocate(lg_w(n,n), lg_dqa(n), lg_s(n), lg_nsh(n))
