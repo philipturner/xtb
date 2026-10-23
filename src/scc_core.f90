@@ -422,9 +422,20 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    integer  :: lg_mem, lg_ib, lg_stat, lg_i, lg_j
    character(len=64) :: lg_val
    ! last settings reported on stderr (printed once per process, and again whenever they change)
-   real(wp), save :: lg_said(4) = -2.0_wp
+   real(wp), save :: lg_said(5) = -2.0_wp
    real(wp), allocatable :: lg_w(:,:), lg_dqa(:), lg_s(:)
    integer, allocatable :: lg_nsh(:)
+   ! XTB_ODA = r: optimal-damping steps (Cances & Le Bris) on the free energy instead of Broyden mixing; each step
+   ! moves the charges/multipoles x from x_k toward this cycle's output x~ by the lambda in [0,1] that minimizes
+   ! A(lambda) = (1-lambda) L_k + lambda L~ + Ech(x_k + lambda (x~ - x_k)), with L = band energy tr(H0 P) + electronic
+   ! entropy term (linear in P; the linear entropy is a lower bound on the true one, so A is an upper bound on the
+   ! free energy, exact at lambda = 0 and 1, with a descent slope at 0) and Ech = the charge-only energies
+   ! (shell Coulomb + third order, multipoles, D4, point charges, solvation). r > 0: switch to Broyden (fresh
+   ! history) once rmsq < r; r <= 0: ODA to convergence. Convergence test and thresholds unchanged.
+   real(wp) :: lg_oda, lg_odaL, lg_odaE, lg_lam
+   logical  :: lg_odaon, lg_odafirst, lg_trace
+   integer  :: lg_ib0
+   real(wp), allocatable :: lg_xk(:), lg_xt(:), lg_xs(:), lg_tq(:), lg_tqsh(:), lg_tdm(:,:), lg_tqp(:,:), lg_tcm(:)
    logical  :: converged
    logical  :: econverged
    logical  :: qconverged
@@ -461,6 +472,15 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
 
    damp = damp0
    lg_alpha = -1.0_wp; lg_q0 = -1.0_wp; lg_beta = 0.8_wp; lg_mem = 0
+   lg_oda = -huge(1.0_wp); lg_odaon = .false.; lg_odafirst = .true.; lg_ib0 = 0
+   call get_environment_variable('XTB_ODA_TRACE', lg_val, status=lg_stat)
+   lg_trace = lg_stat == 0
+   call get_environment_variable('XTB_ODA', lg_val, status=lg_stat)
+   if (lg_stat == 0) then
+      read(lg_val, *, iostat=lg_stat) lg_oda
+      lg_odaon = lg_stat == 0
+      if (.not.lg_odaon) lg_oda = -huge(1.0_wp)
+   end if
    call get_environment_variable('XTB_BROYDAMP', lg_val, status=lg_stat)
    if (lg_stat == 0) read(lg_val, *, iostat=lg_stat) lg_alpha
    call get_environment_variable('XTB_BROYMEM', lg_val, status=lg_stat)
@@ -469,11 +489,12 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    if (lg_stat == 0) read(lg_val, *, iostat=lg_stat) lg_q0
    call get_environment_variable('XTB_KERKER_BETA', lg_val, status=lg_stat)
    if (lg_stat == 0) read(lg_val, *, iostat=lg_stat) lg_beta
-   if (lg_alpha > 0.0_wp .or. lg_q0 > 0.0_wp .or. lg_mem > 0 .or. any(lg_said > -2.0_wp)) then
-      if (any(lg_said /= [lg_alpha, lg_q0, lg_beta, real(lg_mem, wp)])) then
-         lg_said = [lg_alpha, lg_q0, lg_beta, real(lg_mem, wp)]
-         write(0, '(a,f8.4,a,f8.4,a,f8.4,a,i0)') 'xtb scc-lowgap: XTB_BROYDAMP ', lg_alpha, &
-            & ' XTB_KERKER ', lg_q0, ' XTB_KERKER_BETA ', lg_beta, ' XTB_BROYMEM ', lg_mem
+   if (lg_alpha > 0.0_wp .or. lg_q0 > 0.0_wp .or. lg_mem > 0 .or. lg_odaon .or. any(lg_said > -2.0_wp)) then
+      if (any(lg_said /= [lg_alpha, lg_q0, lg_beta, real(lg_mem, wp), max(lg_oda, -1.0_wp)])) then
+         lg_said = [lg_alpha, lg_q0, lg_beta, real(lg_mem, wp), max(lg_oda, -1.0_wp)]
+         write(0, '(a,f8.4,a,f8.4,a,f8.4,a,i0,a,l1,a,es9.2)') 'xtb scc-lowgap: XTB_BROYDAMP ', lg_alpha, &
+            & ' XTB_KERKER ', lg_q0, ' XTB_KERKER_BETA ', lg_beta, ' XTB_BROYMEM ', lg_mem, &
+            & ' XTB_ODA ', lg_odaon, ' switch ', max(lg_oda, -1.0_wp)
          flush(0)
       end if
    end if
@@ -501,6 +522,8 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    allocate( df(thisiter,nbr),u(thisiter,nbr),a(thisiter,thisiter), &
    &         dq(nbr),dqlast(nbr),qlast_in(nbr),omega(thisiter), &
    &         q_in(nbr),atomicShift(n), source = 0.0_wp )
+   if (lg_odaon) allocate(lg_xk(nbr), lg_xt(nbr), lg_xs(nbr), lg_tq(n), lg_tqsh(nshell), lg_tdm(3,n), &
+      & lg_tqp(6,n), lg_tcm(n), source = 0.0_wp)
 
 !! ------------------------------------------------------------------------
 !  Iteration entry point
@@ -682,6 +705,15 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    ! ------------------------------------------------------------------------
    ! end of SCC convergence part
    qconverged = rmsq < qconv
+   if (lg_odaon .and. lg_oda > 0.0_wp .and. rmsq < lg_oda .and. .not.lg_odafirst) then
+      ! hand over to Broyden with a fresh history from here
+      lg_odaon = .false.
+      lg_ib0 = iter - 1
+   end if
+   if (lg_odaon) then
+      call lg_oda_step
+      call scc_timer_lap(stage_population)
+   else
    if (lg_q0 > 0.0_wp) then
       ! Kerker-like: subtract beta x the local (exp(-q0 r)) average of the atomic residual, spread over the atom's
       ! shells; damps long-wavelength charge sloshing, keeps local transfer (P = 1 - beta W is invertible for beta < 1,
@@ -737,8 +769,8 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
       omegap=0.0_wp
       lg_bd = broydamp
       if (lg_alpha > 0.0_wp) lg_bd = lg_alpha
-      lg_ib = iter
-      if (lg_mem > 0) lg_ib = mod(iter-1, lg_mem) + 1
+      lg_ib = iter - lg_ib0
+      if (lg_mem > 0) lg_ib = mod(iter-lg_ib0-1, lg_mem) + 1
       call broyden(nbr,q_in,qlast_in,dq,dqlast,lg_ib,thisiter,lg_bd,omega,df,u,a)
       qsh(1:nshell)=q_in(1:nshell)
       if (present(aes)) then
@@ -747,6 +779,7 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
       end if
       if(lg_ib.gt.1) omegap=omega(lg_ib-1)
    endif ! Broyden?
+   end if ! ODA?
 
    call qsh2qat(ash, qsh, q) !new qat
 
@@ -785,6 +818,99 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    call scc_timer_done(ndim, min(iter,thisiter))
    jter = jter + min(iter,thisiter)
    fail = .not.converged
+
+contains
+
+   !> charge-only energy terms of eel at the packed charges/multipoles x (q_in layout)
+   subroutine lg_echarge(x, e)
+      real(wp), intent(in) :: x(:)
+      real(wp), intent(out) :: e
+      real(wp) :: es_, ea_, ep_, ed_, epc_, eg_, dum_
+      integer :: k_
+      lg_tqsh = x(1:nshell)
+      call qsh2qat(ash, lg_tqsh, lg_tq)
+      call ies%getEnergy(lg_tq, lg_tqsh, es_)
+      e = es_
+      if (present(aes)) then
+         k_ = nshell
+         call gfn2broyden_out(n, k_, nbr, x, lg_tdm, lg_tqp)
+         ea_ = 0.0_wp; ep_ = 0.0_wp
+         call aniso_electro(aes, n, at, xyz, lg_tq, lg_tdm, lg_tqp, aes%gab3, aes%gab5, ea_, ep_)
+         e = e + ea_ + ep_
+      end if
+      if (present(scD4)) then
+         call scD4%getEnergy(at, lg_tq, ed_)
+         e = e + ed_
+      end if
+      if (pcem) then
+         dum_ = 0.0_wp
+         call electro_pcem(nshell, lg_tqsh, externShift, epc_, dum_)
+         e = e + dum_
+      end if
+      if (allocated(solvation)) then
+         lg_tcm = lg_tq + cm5a
+         call solvation%getEnergy(env, lg_tcm, lg_tqsh, eg_)
+         e = e + eg_
+      end if
+   end subroutine lg_echarge
+
+   !> one optimal-damping step: sets qsh (and dipm, qp) to x_k + lambda (x~ - x_k), omegap = lambda
+   subroutine lg_oda_step
+      real(wp) :: et_, lt_, f_(0:25), lam_(0:25), fb_, a_, b_, c_, lv_, fv_
+      integer :: i_, ib_
+      ! x~ = this cycle's output (raw residual, before any preconditioning)
+      lg_xt = q_in + dq
+      call lg_echarge(lg_xt, et_)
+      lt_ = eel - et_
+      if (lg_odafirst) then
+         lg_odafirst = .false.
+         lg_xk = lg_xt; lg_odaL = lt_; lg_odaE = et_; lg_lam = 1.0_wp
+      else
+         lg_xk = q_in
+         ! A on a geometric grid lambda = 2^(-i/2), i = 0..24 (1 down to 2.4e-4; the descent region can be tiny when
+         ! the charge energy is stiff), then a parabola through the best point and its neighbours
+         lam_(0) = 0.0_wp; f_(0) = lg_odaL + lg_odaE
+         do i_ = 1, 25
+            lam_(i_) = 2.0_wp**(-0.5_wp*(25 - i_))
+            if (i_ == 25) then
+               f_(i_) = eel
+            else
+               lg_xs = lg_xk + lam_(i_) * dq
+               call lg_echarge(lg_xs, fb_)
+               f_(i_) = (1.0_wp - lam_(i_)) * lg_odaL + lam_(i_) * lt_ + fb_
+            end if
+         end do
+         ib_ = minloc(f_(0:25), 1) - 1
+         if (ib_ == 0) ib_ = 1
+         lg_lam = lam_(ib_)
+         if (ib_ < 25) then
+            ! parabola through (lam, f) at ib_-1, ib_, ib_+1 (non-uniform spacing)
+            a_ = (f_(ib_+1) - f_(ib_)) / (lam_(ib_+1) - lam_(ib_))
+            b_ = (f_(ib_) - f_(ib_-1)) / (lam_(ib_) - lam_(ib_-1))
+            c_ = (a_ - b_) / (lam_(ib_+1) - lam_(ib_-1))
+            if (c_ > 0.0_wp) then
+               lv_ = 0.5_wp * (lam_(ib_) + lam_(ib_-1)) - b_ / (2.0_wp * c_)
+               if (lv_ > lam_(ib_-1) .and. lv_ < lam_(ib_+1)) then
+                  lg_xs = lg_xk + lv_ * dq
+                  call lg_echarge(lg_xs, fb_)
+                  fv_ = (1.0_wp - lv_) * lg_odaL + lv_ * lt_ + fb_
+                  if (fv_ < f_(ib_)) lg_lam = lv_
+               end if
+            end if
+         end if
+         lg_xk = lg_xk + lg_lam * dq
+         lg_odaL = (1.0_wp - lg_lam) * lg_odaL + lg_lam * lt_
+         call lg_echarge(lg_xk, lg_odaE)
+      end if
+      if (lg_trace) write(0, '(a,i5,f8.4,2f18.10)') 'xtb oda: iter lambda A(x_k+1) A(output) ', iter, lg_lam, &
+         & lg_odaL + lg_odaE, eel
+      qsh(1:nshell) = lg_xk(1:nshell)
+      if (present(aes)) then
+         k = nshell
+         call gfn2broyden_out(n, k, nbr, lg_xk, dipm, qp)
+      end if
+      omegap = lg_lam
+   end subroutine lg_oda_step
 
 end subroutine scc
 
